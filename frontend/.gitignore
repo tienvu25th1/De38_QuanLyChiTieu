@@ -1,0 +1,32 @@
+
+# Bao ve thong tin nhay cam
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Node.js
+node_modules/
+**/node_modules/
+
+# Logs
+*.log
+logs/
+
+# Build
+dist/
+build/
+coverage/
+
+# VS Code
+.vscode/
+
+# Database local
+pgdata/
+postgres_data/
+
+# He dieu hanh
+.DS_Store
+Thumbs.db

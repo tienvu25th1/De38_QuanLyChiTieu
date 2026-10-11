@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Expense Tracker — Gia đình</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/common.css">
+</head>
+<body data-role="USER" data-page="family">
+  <aside id="side"></aside>
+  <main>
+    <div class="top">
+      <div class="l"><button id="menuBtn" aria-label="Mở menu"><svg class="ic st"><use href="#s-menu"/></svg></button><h1 id="title"></h1></div>
+      <div class="who"><span class="av"><svg class="ic"><use href="#i-user"/></svg></span><span id="uname"></span></div>
+    </div>
+    <div id="view"></div>
+  </main>
+  <dialog id="dlg"><form method="dialog" id="dform"></form></dialog>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="js/common.js"></script>
+</body>
+</html>

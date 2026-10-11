@@ -621,7 +621,7 @@
               <span class="box"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg></span>
               Ghi nhớ đăng nhập
             </label>
-            <a href="#" class="link">Quên mật khẩu?</a>
+            <a href="#" class="link" data-info="forgot">Quên mật khẩu?</a>
           </div>
  
           <div class="stagger" style="--i:5">
@@ -700,7 +700,7 @@
             <label class="check">
               <input type="checkbox" name="terms" data-rule="terms" />
               <span class="box"><svg class="ic" aria-hidden="true"><use href="#i-check"/></svg></span>
-              <span>Tôi đồng ý với <a href="#" class="link">Điều khoản sử dụng</a></span>
+              <span>Tôi đồng ý với <a href="#" class="link" data-info="terms">Điều khoản sử dụng</a></span>
             </label>
           </div>
  
@@ -884,6 +884,62 @@
         meterText.textContent = v ? 'Độ mạnh: ' + levels[s] : hint;
       });
  
+      /* ---------- Tài khoản: lưu ở localStorage (thay bằng gọi API khi có Backend) ---------- */
+      const USERS_KEY = 'et_users', SESSION_KEY = 'et_session';
+      const loadUsers = () => { try { return JSON.parse(localStorage.getItem(USERS_KEY)) || []; } catch (_) { return []; } };
+      const saveUsers = list => localStorage.setItem(USERS_KEY, JSON.stringify(list));
+      async function hashPw(pw) {
+        if (window.crypto && crypto.subtle) {
+          const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pw));
+          return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+        return pw;
+      }
+      function fieldError(input, msg) {
+        const field = input.closest('.field');
+        field.classList.add('invalid');
+        field.querySelector('.error span').textContent = msg;
+        input.setAttribute('aria-invalid', 'true');
+        const wrap = input.closest('.input-wrap');
+        wrap.classList.remove('shake'); void wrap.offsetWidth; wrap.classList.add('shake');
+      }
+
+      // Tài khoản quản trị mặc định (tạo 1 lần nếu chưa có admin): admin@admin.com / Admin@123
+      (async () => {
+        const list = loadUsers();
+        if (!list.some(u => u.role === 'ADMIN')) {
+          list.push({ name: 'Quản trị viên', username: 'admin', email: 'admin@admin.com',
+                      passwordHash: await hashPw('Admin@123'), role: 'ADMIN', status: 'ACTIVE', createdAt: new Date().toISOString() });
+          saveUsers(list);
+        }
+      })();
+
+      async function doLogin(form) {
+        const emailIn = form.querySelector('[name="email"]'), passIn = form.querySelector('[name="password"]');
+        const email = emailIn.value.trim().toLowerCase();
+        const user = loadUsers().find(u => u.email === email);
+        if (!user) return { input: emailIn, error: 'Email chưa được đăng ký' };
+        if (user.passwordHash !== await hashPw(passIn.value)) return { input: passIn, error: 'Mật khẩu không đúng' };
+        if (user.status === 'LOCKED') return { input: emailIn, error: 'Tài khoản đã bị khóa' };
+        localStorage.setItem(SESSION_KEY, JSON.stringify({
+          name: user.name, email: user.email, username: user.username, role: user.role
+        }));
+        return { user };
+      }
+
+      async function doSignup(form) {
+        const q = n => form.querySelector('[name="' + n + '"]');
+        const email = q('email').value.trim().toLowerCase(), username = q('username').value.trim();
+        const list = loadUsers();
+        if (list.some(u => u.email === email)) return { input: q('email'), error: 'Email này đã được đăng ký' };
+        if (list.some(u => u.username.toLowerCase() === username.toLowerCase())) return { input: q('username'), error: 'Tên đăng nhập đã tồn tại' };
+        const user = { name: q('name').value.trim(), username, email,
+                       passwordHash: await hashPw(q('password').value), role: 'USER', status: 'ACTIVE', createdAt: new Date().toISOString() };
+        list.push(user);
+        saveUsers(list);
+        return { user };
+      }
+
       /* ---------- Gửi form ---------- */
       Object.entries(forms).forEach(([mode, form]) => {
         form.addEventListener('submit', async e => {
@@ -912,27 +968,56 @@
           btn.classList.add('loading');
           label.textContent = 'Đang xử lý…';
  
-          // TODO: gọi API đăng nhập / đăng ký của bạn ở đây (fetch / axios...)
-          await sleep(900);
- 
+          // ---- Xử lý đăng nhập / đăng ký thật (lưu trong localStorage) ----
+          let res;
+          try { res = mode === 'login' ? await doLogin(form) : await doSignup(form); }
+          catch (err) { console.error(err); res = { input: form.querySelector('[data-rule]'), error: 'Có lỗi xảy ra, vui lòng thử lại' }; }
+          await sleep(500);
+
+          if (res.error) {
+            btn.classList.remove('loading');
+            btn.disabled = false;
+            label.textContent = original;
+            fieldError(res.input, res.error);
+            res.input.focus();
+            return;
+          }
+
           btn.classList.remove('loading');
           btn.classList.add('success');
           label.innerHTML = '<svg class="ic success-ico" aria-hidden="true"><use href="#i-circle-check"/></svg> Thành công';
           statusEl.textContent = mode === 'login' ? 'Đăng nhập thành công' : 'Tạo tài khoản thành công';
- 
-          await sleep(1500);
- 
+          await sleep(900);
+
+          if (mode === 'login') {
+            // Chuyển sang giao diện theo quyền
+            location.href = res.user.role === 'ADMIN' ? 'admin.html' : 'user.html';
+            return;
+          }
+
+          // Đăng ký xong: quay về form đăng nhập, điền sẵn email
           btn.classList.remove('success');
           btn.disabled = false;
           label.textContent = original;
           form.reset();
           clearErrors(form);
-          if (mode === 'signup') { meter.dataset.level = 0; meterText.textContent = hint; }
+          meter.dataset.level = 0; meterText.textContent = hint;
+          setMode('login');
+          forms.login.querySelector('[name="email"]').value = res.user.email;
+          forms.login.querySelector('[name="password"]').focus();
         });
       });
     })();
   </script>
-</body>
+  <script>
+    /* Liên kết "Quên mật khẩu?" và "Điều khoản sử dụng" */
+    document.addEventListener('click', function (e) {
+      var a = e.target.closest('a[data-info]'); if (!a) return;
+      e.preventDefault();
+      alert(a.dataset.info === 'forgot'
+        ? 'Hệ thống chưa gửi email tự động.\nVui lòng liên hệ quản trị viên: vào Quản lý người dùng → Đặt lại MK để nhận mật khẩu tạm.'
+        : 'Điều khoản sử dụng:\n1. Dữ liệu chi tiêu chỉ phục vụ việc quản lý cá nhân của bạn.\n2. Bạn chịu trách nhiệm bảo mật mật khẩu của mình.\n3. Quản trị viên có thể khóa tài khoản vi phạm.');
+    });
+  </script>
+</body> 
 </html>
- 
-
