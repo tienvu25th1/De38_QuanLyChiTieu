@@ -397,57 +397,117 @@
         <label class="dashboard-month-select"><span id="dashPeriodLabel">${dashboardMonthLabel(S.dm)}</span><input id="dm" type="month" data-live value="${esc(S.dm || '')}" aria-label="Chọn tháng đang xem"></label>
         <button type="button" class="sm dashboard-month-arrow" data-act="dm" data-id="1" aria-label="Tháng sau">${ic('s-right', 1)}</button>
         <button type="button" class="sm dashboard-all-period" data-act="dm" data-id="all">Tất cả</button>
-        <label class="dashboard-scope-select"><span>Phạm vi</span><select id="dashboardScope" data-live aria-label="Chọn phạm vi dashboard">${familyScopeOptions().map(([value, label]) => `<option value="${esc(value)}"${(S.scopeFilter || 'personal') === value ? ' selected' : ''}>${esc(label)}</option>`).join('')}</select></label></div>
+        <label class="dashboard-scope-select"><span>Phạm vi</span><select id="dashboardScope" data-live aria-label="Chọn phạm vi dashboard">${familyScopeOptions().map(([value, label]) => `<option value="${esc(value)}"${(S.dashboardScope || 'personal') === value ? ' selected' : ''}>${esc(label)}</option>`).join('')}</select></label>
+        <span class="dashboard-source">Dữ liệu trên thiết bị</span><button type="button" class="sm" data-act="refreshDash">${ic('s-refresh', 1)}Làm mới</button></div>
     </div><div id="dyn"></div>`;
   const h3 = 'style="margin:14px 0 8px;font-size:14px;color:var(--muted)"';
-  const dashboardExpenseBreakdown = transactions => {
-    const total = sum(transactions, 'out'), groups = {};
-    transactions.filter(t => t.type === 'out').forEach(t => {
-      const category = catOf(t.catId), family = category ? categoryParts(category).family : '';
-      const label = family || category?.name || 'Danh mục khác';
-      groups[label] = (groups[label] || 0) + t.amount;
-    });
-    const ranked = Object.entries(groups).sort((a, b) => b[1] - a[1]), main = ranked.slice(0, 4);
-    const remainder = ranked.slice(4).reduce((value, [, amount]) => value + amount, 0);
-    if (remainder) main.push(['Khác', remainder]);
-    if (!main.length) return chartEmpty('Chưa có khoản chi trong tháng này');
-    return `<div class="dashboard-breakdown">${main.map(([name, amount], index) => {
-      const percentage = total ? Math.round(amount / total * 100) : 0;
-      return `<div class="dashboard-breakdown-item" style="--chart-delay:${index * 65}ms;--category-color:${PALETTE[index % PALETTE.length]}">
-        <div class="dashboard-breakdown-label"><span>${esc(name)}</span><strong>${money(amount)}</strong><b>${percentage}%</b></div>
-        <div class="dashboard-breakdown-track" role="progressbar" aria-label="${esc(name)}" aria-valuenow="${percentage}" aria-valuemin="0" aria-valuemax="100"><i style="--bar-width:${percentage}%"></i></div></div>`;
-    }).join('')}</div>`;
+  const dashboardScopedTransactions = scope => db.tx.filter(t => scope === 'personal'
+    ? t.owner === session.email && (!t.scope || t.scope === 'personal')
+    : t.scope === 'family' && t.familyId === scope);
+  const dashboardChartMonths = transactions => {
+    const latestActivity = transactions.reduce((latest, tx) => tx.date && tx.date.slice(0, 7) > latest ? tx.date.slice(0, 7) : latest, '');
+    const end = monthRe.test(S.dm || '') ? S.dm : (latestActivity || monthNow());
+    return Array.from({ length: 6 }, (_, index) => shiftMonth(end, index - 5));
   };
-  const dashboardBudgets = () => {
+  const dashboardMonthlyValues = transactions => {
+    const months = dashboardChartMonths(transactions);
+    return months.map(month => ({
+      month,
+      income: sum(transactions.filter(tx => tx.date.startsWith(month)), 'in'),
+      expense: sum(transactions.filter(tx => tx.date.startsWith(month)), 'out')
+    }));
+  };
+  const dashboardCompactMoney = value => {
+    if (value >= 1000000) return `${(value / 1000000).toLocaleString('vi-VN', { maximumFractionDigits: 1 })}tr`;
+    if (value >= 1000) return `${(value / 1000).toLocaleString('vi-VN', { maximumFractionDigits: 0 })}k`;
+    return String(Math.round(value));
+  };
+  const dashboardMonthlyChart = (transactions, trend = false) => {
+    const values = dashboardMonthlyValues(transactions);
+    const max = Math.max(...values.flatMap(value => [value.income, value.expense]), 1);
+    const period = `${values[0].month.slice(5, 7)}/${values[0].month.slice(0, 4)} – ${values[5].month.slice(5, 7)}/${values[5].month.slice(0, 4)}`;
+    const baseline = 170, chartHeight = 130;
+    if (!values.some(value => value.income || value.expense)) return chartEmpty('Chưa có giao dịch trong 6 tháng được chọn');
+    if (trend) {
+      const pointsFor = key => values.map((value, index) => ({
+        x: 54 + index * 122,
+        y: baseline - value[key] / max * chartHeight,
+        amount: value[key],
+        month: value.month
+      }));
+      const incomePoints = pointsFor('income'), expensePoints = pointsFor('expense');
+      const drawLine = (points, kind, label) => `<polyline class="dashboard-line ${kind}" points="${points.map(point => `${point.x},${point.y}`).join(' ')}"/>${points.map(point => `<circle class="dashboard-point ${kind}" cx="${point.x}" cy="${point.y}" r="4"><title>${label} ${point.month}: ${money(point.amount)}</title></circle>`).join('')}`;
+      return `<div class="dashboard-chart-period">6 tháng gần nhất · ${period}</div><svg class="dashboard-svg dashboard-trend-svg" viewBox="0 0 720 220" role="img" aria-label="Xu hướng thu nhập và chi tiêu trong 6 tháng">
+        <line class="dashboard-axis" x1="38" y1="${baseline}" x2="700" y2="${baseline}"/>
+        ${[0, 0.5, 1].map(ratio => `<line class="dashboard-gridline" x1="38" y1="${baseline - chartHeight * ratio}" x2="700" y2="${baseline - chartHeight * ratio}"/><text class="dashboard-axis-label" x="34" y="${baseline - chartHeight * ratio - 4}" text-anchor="end">${dashboardCompactMoney(max * ratio)}</text>`).join('')}
+        ${drawLine(incomePoints, 'income', 'Thu nhập')}${drawLine(expensePoints, 'expense', 'Chi tiêu')}
+        ${values.map((value, index) => `<text class="dashboard-axis-label" x="${54 + index * 122}" y="196" text-anchor="middle">${value.month.slice(5, 7)}/${value.month.slice(2, 4)}</text>`).join('')}
+      </svg><div class="dashboard-chart-legend"><span><i class="income"></i>Thu nhập</span><span><i class="expense"></i>Chi tiêu</span></div>`;
+    }
+    return `<div class="dashboard-chart-period">So sánh theo tháng · ${period}</div><svg class="dashboard-svg dashboard-bars-svg" viewBox="0 0 720 220" role="img" aria-label="So sánh thu nhập và chi tiêu theo tháng">
+      <line class="dashboard-axis" x1="38" y1="${baseline}" x2="700" y2="${baseline}"/>
+      ${[0, 0.5, 1].map(ratio => `<line class="dashboard-gridline" x1="38" y1="${baseline - chartHeight * ratio}" x2="700" y2="${baseline - chartHeight * ratio}"/><text class="dashboard-axis-label" x="34" y="${baseline - chartHeight * ratio - 4}" text-anchor="end">${dashboardCompactMoney(max * ratio)}</text>`).join('')}
+      ${values.map((value, index) => {
+        const x = 64 + index * 108, incomeHeight = value.income / max * chartHeight, expenseHeight = value.expense / max * chartHeight;
+        return `<rect class="dashboard-bar income" x="${x}" y="${baseline - incomeHeight}" width="30" height="${incomeHeight}" rx="5"><title>Thu nhập ${value.month}: ${money(value.income)}</title></rect><rect class="dashboard-bar expense" x="${x + 36}" y="${baseline - expenseHeight}" width="30" height="${expenseHeight}" rx="5"><title>Chi tiêu ${value.month}: ${money(value.expense)}</title></rect><text class="dashboard-axis-label" x="${x + 33}" y="196" text-anchor="middle">${value.month.slice(5, 7)}/${value.month.slice(2, 4)}</text>`;
+      }).join('')}
+    </svg><div class="dashboard-chart-legend"><span><i class="income"></i>Thu nhập</span><span><i class="expense"></i>Chi tiêu</span></div>`;
+  };
+  const dashboardBudgets = (transactions, familyId) => {
     const month = monthRe.test(S.dm || '') ? S.dm : monthNow();
-    const entries = myBudgets().filter(b => b.month === month).sort((a, b) => budgetSpent(b) / b.amount - budgetSpent(a) / a.amount);
-    if (!entries.length) return `<div class="dashboard-empty">Chưa có ngân sách cho tháng này.<button type="button" class="sm" data-p="budget">Tạo ngân sách</button></div>`;
-    return `<div class="dashboard-budget-list">${entries.map((b, index) => {
-      const spent = budgetSpent(b), ratio = spent / Math.max(Number(b.amount), 1), pct = progress(spent, b.amount);
-      const state = ratio >= 1 ? 'over' : ratio >= .8 ? 'warn' : 'ok';
-      return `<div class="dashboard-budget-item" style="--chart-delay:${index * 65}ms"><div class="dashboard-budget-head"><b>${esc(catOf(b.catId)?.name || 'Danh mục đã xóa')}</b><span class="dashboard-budget-state ${state}">${ratio >= 1 ? 'Vượt ngân sách' : ratio >= .8 ? 'Gần chạm mức' : `${pct}%`}</span></div>
-        <div class="dashboard-budget-track"><i class="${state}" style="--bar-width:${pct}%"></i></div><div class="dashboard-budget-caption"><span>${money(spent)} đã dùng</span><span>${money(b.amount)}</span></div></div>`;
-    }).join('')}</div>`;
+    const entries = familyId ? [] : myBudgets().filter(b => b.month === month)
+      .sort((a, b) => budgetSpent(b) / Math.max(Number(b.amount), 1) - budgetSpent(a) / Math.max(Number(a.amount), 1));
+    const totalSpent = sum(transactions.filter(tx => tx.date.startsWith(month)), 'out');
+    const family = familyId ? familyOf(familyId) : null;
+    const totalBudget = familyId ? Number(family?.monthlyBudget || 0) : entries.reduce((total, budget) => total + Number(budget.amount || 0), 0);
+    const ratio = totalBudget > 0 ? totalSpent / totalBudget : 0, pct = totalBudget > 0 ? progress(totalSpent, totalBudget) : 0;
+    const state = ratio >= 1 ? 'over' : ratio >= .8 ? 'warn' : 'ok';
+    const budgetSummary = totalBudget > 0 ? `<div class="dashboard-budget-summary">
+        <div><span>Ngân sách tháng</span><strong>${money(totalBudget)}</strong></div><div><span>Đã chi</span><strong>${money(totalSpent)}</strong></div><div><span>Còn lại</span><strong class="${totalBudget - totalSpent < 0 ? 'exp' : 'inc'}">${money(totalBudget - totalSpent)}</strong></div>
+      </div><div class="dashboard-budget-track dashboard-budget-total-track"><i class="${state}" style="--bar-width:${pct}%"></i></div>
+      <div class="dashboard-budget-caption"><span>Đã sử dụng ${pct}%</span><span>${ratio >= 1 ? 'Đã vượt ngân sách' : ratio >= .8 ? 'Sắp chạm ngưỡng 80%' : 'Trong ngân sách'}</span></div>
+      ${ratio >= .8 ? `<p class="dashboard-budget-alert ${state}" role="status">${ratio >= 1 ? `Chi tiêu đã vượt ngân sách ${money(totalSpent - totalBudget)}.` : 'Lưu ý: chi tiêu đã đạt từ 80% ngân sách tháng.'}</p>` : ''}`
+      : `<div class="dashboard-empty">${familyId ? 'Gia đình chưa đặt ngân sách tháng.' : 'Chưa có ngân sách cho tháng này.'}<button type="button" class="sm" data-p="${familyId ? 'family' : 'budget'}">${familyId ? 'Quản lý gia đình' : 'Tạo ngân sách'}</button></div>`;
+    if (familyId) return budgetSummary;
+    const budgetItems = entries.length ? `<div class="dashboard-budget-list">${entries.map((b, index) => {
+      const spent = transactions.filter(t => t.type === 'out' && t.catId === b.catId && t.date.startsWith(b.month)).reduce((s, t) => s + Number(t.amount || 0), 0);
+      const itemRatio = spent / Math.max(Number(b.amount), 1), itemPct = progress(spent, b.amount);
+      const itemState = itemRatio >= 1 ? 'over' : itemRatio >= .8 ? 'warn' : 'ok';
+      return `<div class="dashboard-budget-item" style="--chart-delay:${index * 65}ms"><div class="dashboard-budget-head"><b>${esc(catOf(b.catId)?.name || 'Danh mục đã xóa')}</b><span class="dashboard-budget-state ${itemState}">${itemRatio >= 1 ? 'Vượt ngân sách' : itemRatio >= .8 ? 'Gần chạm mức' : `${itemPct}%`}</span></div>
+        <div class="dashboard-budget-track"><i class="${itemState}" style="--bar-width:${itemPct}%"></i></div><div class="dashboard-budget-caption"><span>${money(spent)} đã dùng</span><span>${money(b.amount)}</span></div></div>`;
+    }).join('')}</div>` : '';
+    return budgetSummary + budgetItems;
   };
   const dashboardRecent = transactions => {
     const items = recent(transactions, 5);
     if (!items.length) return chartEmpty('Chưa có giao dịch trong kỳ này');
     return `<div class="dashboard-recent-list">${items.map(t => `<button type="button" class="dashboard-recent-item" data-act="viewTx" data-id="${esc(t.id)}">
-      <span class="dashboard-recent-icon ${t.type}">${ic(t.type === 'in' ? 'i-coins' : 'i-receipt')}</span><span class="dashboard-recent-description"><b>${esc(t.note || cname(t))}</b><small>${esc(cname(t))} · ${fdate(t.date)}</small></span>
+      <span class="dashboard-recent-icon ${t.type}">${ic(t.type === 'in' ? 'i-coins' : 'i-receipt')}</span><span class="dashboard-recent-description"><b>${esc(t.note || cname(t))}</b><small>${esc(cname(t))} · ${fdate(t.date)} · ${esc(accountLabel(t.accountId || t.account))}</small></span>
       <strong class="${t.type === 'in' ? 'inc' : 'exp'}">${t.type === 'in' ? '+' : '-'}${money(t.amount)}</strong></button>`).join('')}</div>`;
   };
   const userDash = () => {
-    const scope = (S.scopeFilter || 'personal');
-    const familyId = scope === 'family' ? activeFamilyId() : '';
-    const l = familyId ? db.tx.filter(t => t.scope === 'family' && t.familyId === familyId).filter(inMonth) : db.tx.filter(t => t.owner === session.email && (!t.scope || t.scope === 'personal')).filter(inMonth);
+    const scope = S.dashboardScope || 'personal';
+    const familyId = scope === 'personal' ? '' : scope;
+    const family = familyId ? familyOf(familyId) : null;
+    const label = family ? family.name : 'cá nhân';
+    const allScopedTransactions = dashboardScopedTransactions(scope);
+    const l = allScopedTransactions.filter(inMonth);
     const income = sum(l, 'in'), expense = sum(l, 'out');
+    const monthlyValues = dashboardMonthlyValues(allScopedTransactions);
     return `<div class="dashboard-summary">
-        <div class="dashboard-total income"><span>${scope === 'family' ? 'TỔNG THU GIA ĐÌNH' : 'TỔNG THU'}</span><strong>+${money(income)}</strong></div><div class="dashboard-total expense"><span>${scope === 'family' ? 'TỔNG CHI GIA ĐÌNH' : 'TỔNG CHI'}</span><strong>-${money(expense)}</strong></div>
-        <div class="dashboard-balance"><span>${scope === 'family' ? 'SỐ DƯ GIA ĐÌNH' : 'SỐ DƯ'}</span><strong>${money(income - expense)}</strong></div></div>
+        <div class="dashboard-total income">${ic('i-coins')}<span>TỔNG THU NHẬP</span><strong>+${money(income)}</strong></div>
+        <div class="dashboard-total expense">${ic('i-receipt')}<span>TỔNG CHI TIÊU</span><strong>-${money(expense)}</strong></div>
+        <div class="dashboard-total balance-stat"><span>CHÊNH LỆCH THU CHI</span><strong class="${income - expense < 0 ? 'exp' : 'inc'}">${income - expense < 0 ? '-' : '+'}${money(Math.abs(income - expense))}</strong><small>Thu nhập trừ chi tiêu trong kỳ</small></div>
+        <div class="dashboard-total transaction-stat">${ic('i-layer-group')}<span>TỔNG GIAO DỊCH</span><strong>${l.length.toLocaleString('vi-VN')}</strong><small>${l.filter(tx => tx.type === 'in').length} thu · ${l.filter(tx => tx.type === 'out').length} chi</small></div>
+      </div>
+      <div class="dashboard-charts">
+        <section class="card dashboard-section dashboard-chart-panel"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">DÒNG TIỀN</span><h2>Thu nhập và chi tiêu theo tháng</h2></div></div>${dashboardMonthlyChart(allScopedTransactions)}</section>
+        <section class="card dashboard-section dashboard-chart-panel"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">PHÂN BỔ CHI TIÊU</span><h2>Chi tiêu theo danh mục</h2></div><span class="dashboard-section-total">${money(expense)}</span></div>${pie(by(l, 'out'))}</section>
+        <section class="card dashboard-section dashboard-chart-panel dashboard-trend-panel"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">BIẾN ĐỘNG</span><h2>Xu hướng tài chính</h2></div></div>${dashboardMonthlyChart(allScopedTransactions, true)}</section>
+      </div>
       <div class="dashboard-content-grid">
-        <section class="card dashboard-section"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">PHÂN BỔ CHI TIÊU</span><h2>${scope === 'family' ? 'Chi tiêu theo danh mục gia đình' : 'Chi tiêu theo danh mục'}</h2></div><span class="dashboard-section-total">${money(expense)}</span></div>${dashboardExpenseBreakdown(l)}</section>
-        <section class="card dashboard-section"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">NGÂN SÁCH · ${dashboardMonthLabel(monthRe.test(S.dm || '') ? S.dm : monthNow())}</span><h2>${scope === 'family' ? 'Ngân sách gia đình' : 'Ngân sách'}</h2></div><button type="button" class="sm" data-p="budget">Quản lý</button></div>${dashboardBudgets()}</section>
-        <section class="card dashboard-section dashboard-recent-section"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">HOẠT ĐỘNG MỚI NHẤT</span><h2>${scope === 'family' ? 'Giao dịch gia đình gần đây' : 'Giao dịch gần đây'}</h2></div></div>${dashboardRecent(l)}<button type="button" class="sm dashboard-view-all" data-p="tx">XEM TẤT CẢ GIAO DỊCH</button></section>
+        <section class="card dashboard-section"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">NGÂN SÁCH · ${dashboardMonthLabel(monthRe.test(S.dm || '') ? S.dm : monthNow())}</span><h2>${family ? `Ngân sách · ${esc(family.name)}` : 'Ngân sách cá nhân'}</h2></div><button type="button" class="sm" data-p="${family ? 'family' : 'budget'}">Quản lý</button></div>${dashboardBudgets(allScopedTransactions, familyId)}</section>
+        <section class="card dashboard-section dashboard-recent-section"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">HOẠT ĐỘNG MỚI NHẤT</span><h2>Giao dịch gần đây · ${esc(label)}</h2></div></div>${dashboardRecent(l)}<button type="button" class="sm dashboard-view-all" data-p="tx">XEM TẤT CẢ GIAO DỊCH</button></section>
       </div>`; };
   const adminDash = () => { const l = db.tx.filter(inMonth), has = l.length, now = Date.now();
     const newU = db.users.filter(u => u.createdAt && now - Date.parse(u.createdAt) < 30 * 864e5).length;
@@ -913,6 +973,7 @@
       confirmBox('Xóa danh mục này?', () => { db.cats = db.cats.filter(x => x.id !== id); saveCats(); refreshRows(); toast('Đã xóa danh mục'); }); },   // TODO: DELETE /api/categories/:id
     /* --- Dashboard --- */
     dm: id => setDm(id === 'all' ? '' : id === 'now' ? today().slice(0, 7) : shiftMonth(monthRe.test(S.dm || '') ? S.dm : today().slice(0, 7), Number(id))),
+    refreshDash: () => { sync(); render(); toast('Đã làm mới dữ liệu từ thiết bị'); },
     editBudget: id => { if (!myBudgets().some(b => b.id === id)) return; S.editBudget = id; render(); scrollTo({ top: 0, behavior: 'smooth' }); },
     delBudget: id => { if (!myBudgets().some(b => b.id === id)) return; confirmBox('Xóa ngân sách này?', () => { db.budgets = db.budgets.filter(b => b.id !== id); saveBudgets(); delete S.editBudget; render(); toast('Đã xóa ngân sách'); }); },
     editGoal: id => { if (!myGoals().some(g => g.id === id)) return; S.editGoal = id; render(); scrollTo({ top: 0, behavior: 'smooth' }); },
@@ -1083,11 +1144,11 @@
   document.addEventListener('submit', e => { const f = e.target.closest('form[data-f]'); if (!f) return; e.preventDefault(); FORM[f.dataset.f](f, Object.fromEntries(new FormData(f))); });
   document.addEventListener('input', e => {
     const t = e.target; t.closest('.field')?.classList.remove('invalid');
-    if (t.hasAttribute('data-live')) { S[t.id] = t.value; if (t.id !== 'ps') S.pg = 1; refreshRows(); }
+    if (t.hasAttribute('data-live')) { S[t.id === 'dashboardScope' ? 'dashboardScope' : t.id] = t.value; if (t.id !== 'ps') S.pg = 1; refreshRows(); }
   });
   document.addEventListener('change', e => {
     const t = e.target;
-    if (t.hasAttribute('data-live')) { S[t.id] = t.value; if (t.id !== 'ps') S.pg = 1; refreshRows(); }
+    if (t.hasAttribute('data-live')) { S[t.id === 'dashboardScope' ? 'dashboardScope' : t.id] = t.value; if (t.id !== 'ps') S.pg = 1; refreshRows(); }
     if (t.id === 'type' && t.form?.dataset.f === 'tx') $('#cat', t.form).innerHTML = catOpts('', 'Chọn danh mục', t.value);   // chỉ hiện danh mục đúng loại Thu/Chi
   });
   $('#menuBtn').onclick = () => $('#side').classList.toggle('open');

@@ -1,0 +1,8 @@
+DA BO SUNG API (CHUA THAY DOI GIAO DIEN)
+1. Sao luu du an hien tai. Giai nen va sao chep 3 file backend/src/app.js, backend/src/routes/transaction.routes.js, backend/src/routes/dashboard.routes.js vao du an.
+2. Chay backend nhu cu: cd backend ; npm start
+3. Dang nhap API /api/auth/login de lay token. Gui Authorization: Bearer <token>.
+4. GET /api/transactions?scope=personal ; GET /api/dashboard/summary?month=10&year=2026
+5. POST /api/transactions voi JSON: {"account_id":"UUID","category_id":"UUID","type":"out","amount":10000,"transaction_date":"2026-10-11","note":"Thu nghiem"}.
+6. DELETE /api/transactions/:id (chi xoa giao dich ca nhan cua minh).
+LUU Y: Chua tich hop frontend; frontend van su dung localStorage. Khong xoa localStorage truoc khi chuyen du lieu. Khong dua .env len GitHub.

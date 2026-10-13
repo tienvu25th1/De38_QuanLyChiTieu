@@ -3,6 +3,8 @@ const express = require('express');
 const client = require('prom-client');
 
 const authRoutes = require('./routes/auth.routes');
+const transactionRoutes = require('./routes/transaction.routes');
+const dashboardRoutes = require('./routes/dashboard.routes');
 const {
   notFound,
   errorHandler
@@ -108,6 +110,8 @@ app.use((req, res, next) => {
 // ========================================
 
 app.use('/api/auth', authRoutes);
+app.use('/api/transactions', transactionRoutes);
+app.use('/api/dashboard', dashboardRoutes);
 
 // ========================================
 // 7. API KIEM TRA BACKEND
