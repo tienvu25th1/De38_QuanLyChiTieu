@@ -46,12 +46,29 @@
     if (!me || me.status === 'LOCKED' || me.role !== ROLE) { leave(); return; }   // bị xóa / khóa / đổi quyền → đăng nhập lại
   }
 
-  const FAMILY_KEY = 'et_families', FAMILY_MEMBERS_KEY = 'et_family_members', FAMILY_INVITES_KEY = 'et_family_invites';
-  const db = { tx: read(TX_KEY, []), cats: read(CAT_KEY, []), users: read(USERS_KEY, []), budgets: read(BUDGET_KEY, []), goals: read(GOAL_KEY, []), accounts: read(ACCOUNTS_KEY, []), families: read(FAMILY_KEY, []), familyMembers: read(FAMILY_MEMBERS_KEY, []), familyInvites: read(FAMILY_INVITES_KEY, []) };
+  const FAMILY_KEY = 'et_families', FAMILY_MEMBERS_KEY = 'et_family_members', FAMILY_INVITES_KEY = 'et_family_invites', FAMILY_FUND_KEY = 'et_family_fund_entries', ACCOUNT_ADJUSTMENTS_KEY = 'et_account_adjustments', NOTIFICATIONS_KEY = 'et_notifications';
+  const db = { tx: read(TX_KEY, []), cats: read(CAT_KEY, []), users: read(USERS_KEY, []), budgets: read(BUDGET_KEY, []), goals: read(GOAL_KEY, []), accounts: read(ACCOUNTS_KEY, []), families: read(FAMILY_KEY, []), familyMembers: read(FAMILY_MEMBERS_KEY, []), familyInvites: read(FAMILY_INVITES_KEY, []), familyFundEntries: read(FAMILY_FUND_KEY, []), accountAdjustments: read(ACCOUNT_ADJUSTMENTS_KEY, []), notifications: read(NOTIFICATIONS_KEY, []) };
   const saveUsers = () => write(USERS_KEY, db.users), saveTx = () => write(TX_KEY, db.tx), saveCats = () => write(CAT_KEY, db.cats);
-  const saveBudgets = () => write(BUDGET_KEY, db.budgets), saveGoals = () => write(GOAL_KEY, db.goals), saveAccounts = () => write(ACCOUNTS_KEY, db.accounts);
-  const saveFamilies = () => write(FAMILY_KEY, db.families), saveFamilyMembers = () => write(FAMILY_MEMBERS_KEY, db.familyMembers), saveFamilyInvites = () => write(FAMILY_INVITES_KEY, db.familyInvites);
-  const sync = () => { db.users = read(USERS_KEY, []); db.tx = read(TX_KEY, []); db.cats = read(CAT_KEY, []); db.budgets = read(BUDGET_KEY, []); db.goals = read(GOAL_KEY, []); db.accounts = read(ACCOUNTS_KEY, []); db.families = read(FAMILY_KEY, []); db.familyMembers = read(FAMILY_MEMBERS_KEY, []); db.familyInvites = read(FAMILY_INVITES_KEY, []); };
+  const saveBudgets = () => write(BUDGET_KEY, db.budgets), saveGoals = () => write(GOAL_KEY, db.goals), saveAccounts = () => write(ACCOUNTS_KEY, db.accounts), saveAccountAdjustments = () => write(ACCOUNT_ADJUSTMENTS_KEY, db.accountAdjustments);
+  const saveFamilies = () => write(FAMILY_KEY, db.families), saveFamilyMembers = () => write(FAMILY_MEMBERS_KEY, db.familyMembers), saveFamilyInvites = () => write(FAMILY_INVITES_KEY, db.familyInvites), saveFamilyFundEntries = () => write(FAMILY_FUND_KEY, db.familyFundEntries);
+  const saveNotifications = () => write(NOTIFICATIONS_KEY, db.notifications);
+  const sync = () => { db.users = read(USERS_KEY, []); db.tx = read(TX_KEY, []); db.cats = read(CAT_KEY, []); db.budgets = read(BUDGET_KEY, []); db.goals = read(GOAL_KEY, []); db.accounts = read(ACCOUNTS_KEY, []); db.families = read(FAMILY_KEY, []); db.familyMembers = read(FAMILY_MEMBERS_KEY, []); db.familyInvites = read(FAMILY_INVITES_KEY, []); db.familyFundEntries = read(FAMILY_FUND_KEY, []); db.accountAdjustments = read(ACCOUNT_ADJUSTMENTS_KEY, []); db.notifications = read(NOTIFICATIONS_KEY, []); };
+  const notificationsForMe = () => db.notifications.filter(notification => notification.owner === session.email)
+    .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  const unreadNotificationCount = () => notificationsForMe().filter(notification => !notification.readAt).length;
+  const recordNotification = (owner, eventKey, type, title, text, familyId = '') => {
+    if (!owner || db.notifications.some(notification => notification.owner === owner && notification.eventKey === eventKey)) return;
+    const notification = { id: uid(), owner, eventKey, type, title, text, createdAt: new Date().toISOString(),
+      ...(familyId ? { familyId } : {}) };
+    db.notifications.push(notification);
+    try {
+      saveNotifications();
+    } catch (error) {
+      db.notifications = db.notifications.filter(item => item.id !== notification.id);
+      console.error('Unable to save notification', error);
+      toast('Không thể lưu thông báo. Vui lòng kiểm tra dung lượng lưu trữ trình duyệt.', 4200);
+    }
+  };
   const DEFAULT_EXPENSE_CATEGORIES = [
     ['Ăn uống', ['Đi chợ/Siêu thị', 'Ăn ngoài', 'Cà phê', 'Giao đồ ăn']],
     ['Di chuyển', ['Xăng xe', 'Xe công nghệ (Grab/Be)', 'Vé xe/Máy bay', 'Phí đỗ/VETC']],
@@ -88,11 +105,24 @@
   const findUser = email => db.users.find(u => u.email === email);
   const uname = e => findUser(e)?.name || e || '—';
   const catOf = id => db.cats.find(c => c.id === id);
-  const cname = t => catOf(t.catId)?.name || '(đã xóa)';
-  // User thấy danh mục của mình + danh mục mặc định (owner rỗng); Admin thấy tất cả
-  const visCats = () => (isAdmin ? db.cats : db.cats.filter(c => !c.owner || c.owner === session.email))
-    .slice().sort((a, b) => a.name.localeCompare(b.name, 'vi'));
-  const catLabel = c => isAdmin && c.owner ? `${c.name} — ${uname(c.owner)}` : c.name;
+  const categoryName = c => c.parentId ? `${catOf(c.parentId)?.name || 'Danh mục'} › ${c.name}` : c.name;
+  const cname = t => { const category = catOf(t.catId); return category ? categoryName(category) : '(đã xóa)'; };
+  // Danh mục chung (owner rỗng / scope global) là mẫu dùng cho cá nhân VÀ gia đình.
+  // Danh mục của một gia đình chỉ thuộc gia đình đó; người ngoài không nhìn thấy.
+  const isGlobalCategory = category => category?.scope !== 'family' && !category?.owner;
+  const visCats = (scope = 'personal', familyId = '', includeHidden = false) => db.cats.filter(category => {
+    if (scope === 'global') return isGlobalCategory(category);
+    if (scope === 'all' && isAdmin) return true;
+    if (scope === 'family') return isGlobalCategory(category) || (
+      category.scope === 'family' && category.familyId === familyId && (isAdmin || !!familyMemberOf(familyId)));
+    if (scope === 'personal') return isGlobalCategory(category) ||
+      (category.scope !== 'family' && (isAdmin || category.owner === session.email));
+    return false;
+  })
+    .filter(category => includeHidden || !category.hidden)
+    .slice().sort((a, b) => categoryName(a).localeCompare(categoryName(b), 'vi'));
+  const catLabel = c => `${c.icon || '📦'} ${categoryName(c)}${isAdmin && c.owner ? ` — ${uname(c.owner)}` : ''}`;
+  const categoryColor = category => /^#[0-9a-f]{6}$/i.test(category?.color || '') ? category.color : '#2563eb';
   const CATEGORY_SECTIONS = [
     { name: 'Thiết yếu', families: ['Ăn uống', 'Di chuyển', 'Hóa đơn & Tiện ích', 'Sức khỏe'] },
     { name: 'Lối sống', families: ['Mua sắm', 'Giải trí & Du lịch'] },
@@ -100,16 +130,20 @@
     { name: 'Mối quan hệ & Hiếu hỷ', families: ['Đối ngoại'] },
     { name: 'Tài chính & Nghĩa vụ', families: ['Khoản nợ & Phí', 'Tích lũy & Đầu tư'] }
   ];
-  const categoryParts = c => { const split = c.name.indexOf(' — '); return split < 0 ? { family: '', leaf: c.name } : { family: c.name.slice(0, split), leaf: c.name.slice(split + 3) }; };
+  const categoryParts = c => {
+    if (c.parentId) return { family: catOf(c.parentId)?.name || '', leaf: c.name };
+    const split = c.name.indexOf(' — ');
+    return split < 0 ? { family: '', leaf: c.name } : { family: c.name.slice(0, split), leaf: c.name.slice(split + 3) };
+  };
   const categorySection = c => {
     const { family } = categoryParts(c), section = CATEGORY_SECTIONS.find(s => s.families.includes(family));
     return section?.name || (c.type === 'in' ? 'Thu nhập' : c.owner ? (isAdmin ? `Danh mục · ${uname(c.owner)}` : 'Danh mục của tôi') : 'Danh mục khác');
   };
   const myTx = () => {
     if (isAdmin) return db.tx;
-    const familyId = (S.scopeFilter || 'personal') === 'family' ? activeFamilyId() : '';
+    const familyId = S.scopeFilter && S.scopeFilter !== 'personal' ? S.scopeFilter : '';
     return db.tx.filter(t => {
-      if (t.scope === 'family') return !!familyId && t.familyId === familyId;
+      if (t.scope === 'family') return !!familyId && t.familyId === familyId && !!familyMemberOf(familyId);
       return t.owner === session.email && (!t.scope || t.scope === 'personal');
     });
   };
@@ -126,10 +160,30 @@
   const shiftMonth = (ym, n) => { let [y, m] = ym.split('-').map(Number); m += n; while (m > 12) { m -= 12; y++; } while (m < 1) { m += 12; y--; } return y + '-' + String(m).padStart(2, '0'); };
   const top = (m, n = 5) => Object.fromEntries(Object.entries(m).sort((a, b) => b[1] - a[1]).slice(0, n));
   const familyOf = id => db.families.find(f => f.id === id);
-  const familyMembersOf = familyId => db.familyMembers.filter(m => m.familyId === familyId && m.status !== 'PENDING');
-  const myFamilyMemberships = () => db.familyMembers.filter(m => m.userEmail === session.email && m.status !== 'PENDING');
+  const familyMembersOf = familyId => db.familyMembers.filter(m => m.familyId === familyId && m.status === 'ACTIVE');
+  const familyMemberOf = (familyId, email = session.email) => familyMembersOf(familyId).find(member => member.userEmail === email);
+  const familyRoleOf = (familyId, email = session.email) => familyMemberOf(familyId, email)?.role || '';
+  const canManageFamily = familyId => {
+    const family = familyOf(familyId);
+    return !!family && (family.ownerEmail === session.email || ['OWNER', 'MANAGER'].includes(familyRoleOf(familyId)));
+  };
+  const canManageFamilyRoles = familyId => familyOf(familyId)?.ownerEmail === session.email;
+  const canEditFamilyTransaction = transaction => transaction.scope === 'family'
+    ? !!familyMemberOf(transaction.familyId) && (canManageFamily(transaction.familyId) || transaction.owner === session.email)
+    : transaction.owner === session.email;
+  const canDeleteFamilyTransaction = transaction => transaction.scope === 'family'
+    ? !!familyMemberOf(transaction.familyId) && (canManageFamily(transaction.familyId) || transaction.owner === session.email)
+    : transaction.owner === session.email;
+  const canViewTransaction = transaction => isAdmin || (transaction.scope === 'family'
+    ? !!familyMemberOf(transaction.familyId)
+    : transaction.owner === session.email);
+  const myFamilyMemberships = () => db.familyMembers.filter(m => m.userEmail === session.email && m.status === 'ACTIVE');
   const familyScopeOptions = () => { const list = myFamilyMemberships().map(m => { const family = familyOf(m.familyId); return family ? [m.familyId, family.name] : null; }).filter(Boolean); return [['personal', 'Cá nhân'], ...list]; };
-  const activeFamilyId = () => (myFamilyMemberships()[0] || {}).familyId || '';
+  const transactionMemberOptions = () => S.scopeFilter && S.scopeFilter !== 'personal'
+    ? familyMembersOf(S.scopeFilter).map(member => [member.userEmail, uname(member.userEmail)])
+    : [];
+  const activeFamilyId = () => myFamilyMemberships().some(member => member.familyId === S.familyId)
+    ? S.familyId : (myFamilyMemberships()[0] || {}).familyId || '';
   const activeFamily = () => { const familyId = activeFamilyId(); return familyId ? familyOf(familyId) : null; };
   const familyVisibleTx = () => {
     if (isAdmin) return db.tx;
@@ -143,20 +197,87 @@
   /* ===== Dựng ô nhập ===== */
   const opt = (arr, sel, ph) => (ph !== undefined ? `<option value="">${ph}</option>` : '') +
     arr.map(([v, l]) => `<option value="${esc(v)}"${v === sel ? ' selected' : ''}>${esc(l)}</option>`).join('');
-  const catOpts = (sel, ph, type) => {
-    const categories = visCats().filter(c => !type || c.type === type), groups = new Map();
+  const catOpts = (sel, ph, type, extraCategories = [], scope = 'personal', familyId = '') => {
+    const eligible = scope === 'all' && isAdmin ? db.cats.filter(category => !category.hidden) : visCats(scope, familyId);
+    const categories = [...new Map([...eligible, ...extraCategories.filter(Boolean)].filter(category =>
+      (!type || category.type === type) && (!db.cats.some(child => child.parentId === category.id && !child.hidden) || category.id === sel))
+      .map(category => [category.id, category])).values()], groups = new Map();
     categories.forEach(c => { const section = categorySection(c); if (!groups.has(section)) groups.set(section, []); groups.get(section).push(c); });
     const order = [...CATEGORY_SECTIONS.map(s => s.name), 'Thu nhập', 'Danh mục của tôi', 'Danh mục khác', ...Array.from(groups.keys()).sort((a, b) => a.localeCompare(b, 'vi'))];
     return (ph !== undefined ? `<option value="">${esc(ph)}</option>` : '') + [...new Set(order)].filter(section => groups.has(section)).map(section =>
       `<optgroup label="${esc(section)}">${groups.get(section).map(c => `<option value="${esc(c.id)}"${c.id === sel ? ' selected' : ''}>${esc(catLabel(c))}</option>`).join('')}</optgroup>`).join('');
   };
   const TYPES = [['in', 'Thu'], ['out', 'Chi']];
+  const TRANSACTION_TYPES = [...TYPES, ['transfer', 'Chuyển ví']];
   const ACCOUNT_TYPES = [['cash', 'Tiền mặt'], ['bank', 'Ngân hàng'], ['wallet', 'Ví điện tử']];
   const LEGACY_ACCOUNT_TYPES = { cash: 'cash', bank_account: 'bank', e_wallet: 'wallet' };
   const accountLabel = value => db.accounts.find(a => a.id === value)?.name || ACCOUNT_TYPES.find(([key]) => key === LEGACY_ACCOUNT_TYPES[value])?.[1] || 'Chưa chọn';
-  const myAccounts = () => db.accounts.filter(a => a.owner === session.email).slice().sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name, 'vi'));
-  const accountBalance = account => Number(account.openingBalance || 0) + db.tx.filter(t => t.owner === account.owner && t.accountId === account.id)
-    .reduce((balance, transaction) => balance + (transaction.type === 'in' ? Number(transaction.amount) : -Number(transaction.amount)), 0);
+  const accountIsFamily = account => account.scope === 'family' && !!account.familyId;
+  const accountCanUse = account => accountIsFamily(account)
+    ? db.familyMembers.some(member => member.familyId === account.familyId && member.userEmail === session.email && member.status === 'ACTIVE')
+    : account.owner === session.email;
+  const sortAccounts = accounts => accounts.slice().sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name, 'vi'));
+  const myAccounts = () => sortAccounts(db.accounts.filter(a => !a.hidden && !accountIsFamily(a) && a.owner === session.email));
+  const familyAccounts = familyId => sortAccounts(db.accounts.filter(account => !account.hidden && accountIsFamily(account) && account.familyId === familyId && accountCanUse(account)));
+  const visibleAccounts = () => sortAccounts(db.accounts.filter(account => accountCanUse(account) && !account.goalId));
+  const transactionAccounts = (scope, familyId) => scope === 'family' ? familyAccounts(familyId) : myAccounts();
+  const updateTransactionAccountOptions = form => {
+    if (!form) return;
+    const scope = form.querySelector('input[name="scope"]:checked')?.value || form.querySelector('input[name="scope"][type="hidden"]')?.value || 'personal';
+    const familyId = form.querySelector('#familyId')?.value || form.querySelector('input[name="familyId"][type="hidden"]')?.value || activeFamilyId();
+    const accounts = transactionAccounts(scope, familyId);
+    ['account', 'fromAccount', 'toAccount'].forEach(name => {
+      const select = form.elements.namedItem(name);
+      if (!select || select.tagName !== 'SELECT') return;
+      const current = select.value;
+      const oldAccount = db.accounts.find(account => account.id === current && accountCanUse(account)
+        && accountIsFamily(account) === (scope === 'family') && (!accountIsFamily(account) || account.familyId === familyId));
+      if (oldAccount && !accounts.some(account => account.id === oldAccount.id)) accounts.push(oldAccount);
+      const placeholder = name === 'toAccount' ? 'Chọn ví nhận' : name === 'fromAccount' ? 'Chọn ví nguồn' : 'Chọn ví/tài khoản';
+      select.innerHTML = opt(accounts.map(account => [account.id, account.name]), current, placeholder);
+    });
+    const familyFields = form.querySelector('#txFamilyFields');
+    if (familyFields) familyFields.hidden = scope !== 'family';
+    const hint = form.querySelector('#txFamilySetupHint');
+    if (hint) {
+      const missingWallet = scope === 'family' && !accounts.length;
+      hint.hidden = !missingWallet;
+      if (missingWallet) hint.textContent = '🏦 Gia đình chưa có ví quỹ chung. Hãy vào Ví / Tài khoản tiền → Thêm ví → Ví quỹ chung gia đình trước khi lưu giao dịch.';
+    }
+  };
+  const accountTransactionDelta = (account, transaction) => {
+    if (!(transaction.accountId === account.id || transaction.toAccountId === account.id || transaction.account === account.id)) return 0;
+    const incoming = transaction.toAccountId === account.id;
+    if (transaction.type === 'transfer') return incoming ? Number(transaction.amount || 0) : -Number(transaction.amount || 0);
+    return transaction.type === 'in' ? Number(transaction.amount || 0) : transaction.type === 'out' ? -Number(transaction.amount || 0) : 0;
+  };
+  const accountBalance = account => {
+    const transactionBalance = db.tx.filter(transaction => accountIsFamily(account)
+      ? transaction.scope === 'family' && transaction.familyId === account.familyId
+      : transaction.owner === account.owner && transaction.scope !== 'family')
+      .reduce((balance, transaction) => balance + accountTransactionDelta(account, transaction), 0);
+    const adjustments = db.accountAdjustments.filter(adjustment => adjustment.accountId === account.id)
+      .reduce((balance, adjustment) => balance + Number(adjustment.delta || 0), 0);
+    return Number(account.openingBalance || 0) + transactionBalance + adjustments;
+  };
+  const accountLedger = account => {
+    const events = [{ id: `${account.id}-opening`, date: '0000-01-01', label: 'Số dư đầu kỳ', amount: Number(account.openingBalance || 0), kind: 'opening' }];
+    db.tx.filter(transaction => accountIsFamily(account)
+      ? transaction.scope === 'family' && transaction.familyId === account.familyId
+      : transaction.owner === account.owner && transaction.scope !== 'family')
+      .forEach(transaction => {
+        const delta = accountTransactionDelta(account, transaction);
+        if (!delta) return;
+        events.push({ id: transaction.id, date: transaction.date, label: transaction.type === 'transfer' ? (delta > 0 ? `Nhận chuyển khoản · ${accountLabel(transaction.accountId)}` : `Chuyển đến ${accountLabel(transaction.toAccountId)}`) : `${transaction.type === 'in' ? 'Thu nhập' : 'Chi tiêu'}${transaction.note ? ` · ${transaction.note}` : ''}`, amount: delta, kind: transaction.type });
+      });
+    db.accountAdjustments.filter(adjustment => adjustment.accountId === account.id).forEach(adjustment =>
+      events.push({ id: adjustment.id, date: adjustment.createdAt, label: `Đối soát${adjustment.note ? ` · ${adjustment.note}` : ''}`, amount: Number(adjustment.delta || 0), kind: 'adjustment' }));
+    let balance = 0;
+    return events.sort((a, b) => (a.date || '').localeCompare(b.date || '')).map(event => {
+      balance += event.amount;
+      return { ...event, balanceAfter: balance };
+    }).reverse();
+  };
   const accountTypeLabel = type => ACCOUNT_TYPES.find(([key]) => key === type)?.[1] || 'Tài khoản khác';
   if (!isAdmin) {
     const defaults = [
@@ -167,7 +288,11 @@
     let accountsChanged = false, transactionsChanged = false;
     defaults.forEach(({ type, name }) => {
       if (db.accounts.some(a => a.owner === session.email && a.type === type)) return;
-      db.accounts.push({ id: uid(), owner: session.email, name, type, openingBalance: 0, note: '', createdAt: new Date().toISOString() });
+      db.accounts.push({ id: uid(), owner: session.email, name, type, openingBalance: 0, scope: 'personal', hidden: false, note: '', createdAt: new Date().toISOString() });
+      accountsChanged = true;
+    });
+    db.accounts.filter(account => account.owner === session.email && !account.scope).forEach(account => {
+      account.scope = 'personal';
       accountsChanged = true;
     });
     db.tx.filter(t => t.owner === session.email && !t.accountId).forEach(transaction => {
@@ -182,13 +307,18 @@
   }
   const PAYMENT_METHODS = [['cash', 'Tiền mặt'], ['bank', 'Chuyển khoản'], ['card', 'Thẻ ngân hàng'], ['wallet', 'Ví điện tử']];
   const paymentLabel = value => PAYMENT_METHODS.find(([key]) => key === value)?.[1] || 'Chưa chọn';
+  const receiptData = receipt => {
+    if (!receipt || typeof receipt.data !== 'string' || typeof receipt.type !== 'string') return '';
+    const allowed = receipt.type === 'application/pdf' || /^image\/(jpeg|png|gif|webp|heic|heif)$/i.test(receipt.type);
+    return allowed && receipt.data.startsWith(`data:${receipt.type};base64,`) ? receipt.data : '';
+  };
   const formatTimestamp = value => { const date = value ? new Date(value) : null; return date && !Number.isNaN(date.getTime()) ? date.toLocaleString('vi-VN') : '—'; };
   function field(id, label, icon, o = {}) {
     const tag = o.tag || 'input', st = icon.startsWith('s-');
     const el = tag === 'select' ? `<select id="${id}" name="${id}" ${o.attr || ''}>${o.opts}</select>`
       : tag === 'textarea' ? `<textarea id="${id}" name="${id}" placeholder=" " rows="2" ${o.attr || ''}>${esc(o.val)}</textarea>`
       : `<input id="${id}" name="${id}" type="${o.type || 'text'}" placeholder=" " value="${esc(o.val)}" ${o.attr || ''}>`;
-    const fl = tag === 'select' || o.type === 'date' || o.type === 'month' ? ' fl' : '';
+    const fl = tag === 'select' || ['date', 'month', 'color'].includes(o.type) ? ' fl' : '';
     const pw = o.type === 'password' ? '<button type="button" class="toggle-pw" aria-label="Hiện mật khẩu" data-act="pw">' + ic('i-eye') + '</button>' : '';
     return `<div class="field"><div class="input-wrap${fl}">${ic(icon, st).replace('class="ic', 'class="ic lead')}${el}<label for="${id}">${label}</label>${pw}</div>` +
       `<div class="err-slot"><p class="error"><span></span></p></div></div>`;
@@ -199,8 +329,77 @@
   const sum = (l, t) => l.filter(x => x.type === t).reduce((s, x) => s + x.amount, 0);
   const monthNow = () => today().slice(0, 7);
   const myBudgets = () => db.budgets.filter(b => b.owner === session.email);
+  const familyBudgets = (familyId, month) => db.budgets.filter(b => b.scope === 'family'
+    && b.familyId === familyId && (!month || b.month === month));
+  const budgetStatus = (spent, amount) => {
+    const ratio = Number(amount) > 0 ? Number(spent || 0) / Number(amount) : 0;
+    return ratio > 1 ? 'over' : ratio >= 1 ? 'exhausted' : ratio >= .8 ? 'warn' : 'ok';
+  };
+  const syncRecurringTransactions = () => {
+    const currentMonth = monthNow(), currentDay = Number(today().slice(8, 10));
+    const additions = [];
+    db.tx.filter(transaction => transaction.recurrence === 'monthly' && !transaction.recurringSource && transaction.type !== 'transfer')
+      .forEach(template => {
+        let period = shiftMonth(template.date.slice(0, 7), 1);
+        while (period <= currentMonth) {
+          const day = Number(template.date.slice(8, 10));
+          if (period === currentMonth && currentDay < day) break;
+          const exists = template.skippedRecurringPeriods?.includes(period)
+            || db.tx.some(transaction => transaction.recurringSource === template.id && transaction.recurrencePeriod === period);
+          if (!exists) {
+            const lastDay = new Date(Number(period.slice(0, 4)), Number(period.slice(5, 7)), 0).getDate();
+            additions.push({ ...template, id: uid(), date: `${period}-${String(Math.min(day, lastDay)).padStart(2, '0')}`,
+              recurrence: 'monthly', recurringSource: template.id, recurrencePeriod: period,
+              receipt: undefined, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+          }
+          period = shiftMonth(period, 1);
+        }
+      });
+    if (!additions.length) return;
+    const next = [...db.tx, ...additions];
+    try {
+      write(TX_KEY, next);
+      db.tx = next;
+      additions.forEach(transaction => recordNotification(transaction.owner, `recurring:${transaction.id}`, 'recurring',
+        'Đã tạo giao dịch định kỳ', `${transaction.note || cname(transaction)} · ${money(transaction.amount)} · ${fdate(transaction.date)}.`));
+    } catch (error) {
+      console.error('Unable to generate recurring transactions', error);
+      toast('Không thể tạo giao dịch định kỳ. Hãy kiểm tra dung lượng lưu trữ của trình duyệt.', 4200);
+    }
+  };
   const myGoals = () => db.goals.filter(g => g.owner === session.email);
-  const budgetSpent = b => myTx().filter(t => t.type === 'out' && t.catId === b.catId && t.date.startsWith(b.month)).reduce((s, t) => s + t.amount, 0);
+  const goalSaved = goal => {
+    const savingsAccount = db.accounts.find(account => account.id === goal.accountId && account.goalId === goal.id);
+    return savingsAccount ? accountBalance(savingsAccount) : Number(goal.saved || 0);
+  };
+  const goalMovements = goal => goal.accountId ? db.tx.filter(transaction => transaction.owner === goal.owner
+    && transaction.type === 'transfer' && [transaction.accountId, transaction.toAccountId].includes(goal.accountId))
+    .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.createdAt || '').localeCompare(a.createdAt || '')) : [];
+  const ensureGoalAccount = goal => {
+    let account = db.accounts.find(item => item.id === goal.accountId && item.goalId === goal.id);
+    if (account) return account;
+    account = { id: uid(), owner: goal.owner, goalId: goal.id, name: `Tiết kiệm · ${goal.name}`, type: 'bank',
+      openingBalance: Number(goal.saved || 0), scope: 'personal', hidden: true, note: 'Ví nội bộ của mục tiêu tiết kiệm',
+      createdAt: new Date().toISOString() };
+    const previousGoals = db.goals.map(item => ({ ...item })), previousAccounts = db.accounts.map(item => ({ ...item }));
+    db.accounts = [...db.accounts, account];
+    goal.accountId = account.id;
+    try {
+      saveAccounts(); saveGoals();
+      return account;
+    } catch (error) {
+      db.goals = previousGoals; db.accounts = previousAccounts;
+      console.error('Unable to create savings goal account', error);
+      toast('Không thể thiết lập ví tiết kiệm. Vui lòng thử lại.', 3800);
+      return null;
+    }
+  };
+  const budgetSpent = b => db.tx.filter(t => t.scope !== 'family' && t.owner === b.owner
+    && t.type === 'out' && t.catId === b.catId && t.date.startsWith(b.month))
+    .reduce((s, t) => s + Number(t.amount || 0), 0);
+  const familyBudgetSpent = b => db.tx.filter(t => t.scope === 'family' && t.familyId === b.familyId
+    && t.type === 'out' && t.catId === b.catId && t.date.startsWith(b.month))
+    .reduce((s, t) => s + Number(t.amount || 0), 0);
   const progress = (value, target) => Math.min(100, Math.round(Number(value || 0) / Math.max(Number(target) || 1, 1) * 100));
   const progressBar = (value, target, state = '') => `<div class="progress-track" role="progressbar" aria-valuenow="${progress(value, target)}" aria-valuemin="0" aria-valuemax="100"><i class="progress-fill ${state}" style="width:${progress(value, target)}%"></i></div>`;
   const emptyRow = (cols) => `<tr class="empty"><td colspan="${cols}">${NONE}</td></tr>`;
@@ -267,8 +466,8 @@
     const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1500);
   }
-  const txCsv = l => [['STT', ...(isAdmin ? ['Người dùng'] : []), 'Loại', 'Số tiền', 'Danh mục', 'Ngày', 'Ví / Tài khoản', 'Phương thức thanh toán', 'Mô tả'],
-    ...l.map((t, i) => [i + 1, ...(isAdmin ? [uname(t.owner)] : []), t.type === 'in' ? 'Thu' : 'Chi', t.amount, cname(t), fdate(t.date), accountLabel(t.accountId || t.account), paymentLabel(t.paymentMethod), t.note || ''])];
+  const txCsv = l => [['STT', ...(isAdmin ? ['Người dùng'] : []), 'Loại', 'Số tiền', 'Danh mục / Ví nhận', 'Ngày', 'Ví / Tài khoản', 'Phương thức thanh toán', 'Mô tả', 'Định kỳ', 'Chứng từ'],
+    ...l.map((t, i) => [i + 1, ...(isAdmin ? [uname(t.owner)] : []), t.type === 'in' ? 'Thu' : t.type === 'out' ? 'Chi' : 'Chuyển ví', t.amount, t.type === 'transfer' ? accountLabel(t.toAccountId) : cname(t), fdate(t.date), accountLabel(t.accountId || t.account), paymentLabel(t.paymentMethod), t.note || '', t.recurrence === 'monthly' ? 'Hàng tháng' : '', t.receipt ? 'Có' : ''])];
 
   /* ===== Hộp thoại ===== */
   const dlg = $('#dlg'), dform = $('#dform');
@@ -280,10 +479,77 @@
   function confirmDeleteTx(t, fn) {
     dform.onsubmit = e => { if (e.submitter?.value === 'ok') fn(); };
     openDlg(`<h2 class="card-title">XÓA GIAO DỊCH?</h2><p class="tx-delete-copy">Bạn có chắc muốn xóa giao dịch này?</p><dl class="tx-delete-detail">
-      <div><dt>Danh mục</dt><dd>${esc(cname(t))}</dd></div><div><dt>Số tiền</dt><dd>${money(t.amount)}</dd></div><div><dt>Ngày</dt><dd>${fdate(t.date)}</dd></div>
+      <div><dt>${t.type === 'transfer' ? 'Chuyển từ → đến' : 'Danh mục'}</dt><dd>${t.type === 'transfer' ? `${esc(accountLabel(t.accountId))} → ${esc(accountLabel(t.toAccountId))}` : esc(cname(t))}</dd></div><div><dt>Số tiền</dt><dd>${money(t.amount)}</dd></div><div><dt>Ngày</dt><dd>${fdate(t.date)}</dd></div>
       </dl><div class="actions"><button class="btn-ghost-d" value="x">HỦY</button><button class="btn-danger" value="ok">${ic('s-trash', 1)}XÓA</button></div>`);
   }
-  function toast(m, ms = 2400) { const t = $('#toast'); t.textContent = m; t.classList.add('show'); clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove('show'), ms); }
+  function toast(m, ms = 2400, action = null) {
+    const t = $('#toast'), message = document.createElement('span');
+    message.textContent = m;
+    t.replaceChildren(message);
+    if (action) {
+      const button = document.createElement('button');
+      button.type = 'button'; button.className = 'toast-action'; button.textContent = action.label;
+      button.addEventListener('click', () => { t.classList.remove('show'); action.run(); }, { once: true });
+      t.appendChild(button);
+    }
+    t.classList.add('show'); clearTimeout(t._t); t._t = setTimeout(() => t.classList.remove('show'), ms);
+  }
+  let undoTransactions = [], undoRecurringSkips = [], undoTimeout;
+  const deleteTransactionsWithUndo = transactions => {
+    const unique = [...new Map(transactions.map(transaction => [transaction.id, transaction])).values()];
+    const deleted = unique.map(transaction => ({ transaction, index: db.tx.findIndex(item => item.id === transaction.id) }))
+      .filter(item => item.index >= 0);
+    if (!deleted.length) return;
+    const ids = new Set(deleted.map(item => item.transaction.id));
+    const recurringSkips = deleted.filter(item => item.transaction.recurringSource && item.transaction.recurrencePeriod)
+      .map(item => ({ sourceId: item.transaction.recurringSource, period: item.transaction.recurrencePeriod }));
+    const next = db.tx.filter(transaction => !ids.has(transaction.id));
+    recurringSkips.forEach(({ sourceId, period }) => {
+      const index = next.findIndex(transaction => transaction.id === sourceId);
+      if (index < 0) return;
+      const source = { ...next[index] };
+      source.skippedRecurringPeriods = [...new Set([...(source.skippedRecurringPeriods || []), period])];
+      next[index] = source;
+    });
+    try {
+      write(TX_KEY, next);
+      db.tx = next;
+    } catch (error) {
+      console.error('Unable to delete transactions', error);
+      toast('Không thể xóa giao dịch. Vui lòng thử lại.', 3600);
+      return;
+    }
+    undoTransactions = deleted; undoRecurringSkips = recurringSkips;
+    clearTimeout(undoTimeout);
+    undoTimeout = setTimeout(() => { undoTransactions = []; undoRecurringSkips = []; }, 8000);
+    refreshRows();
+    toast(`Đã xóa ${deleted.length} giao dịch`, 8000, { label: 'Hoàn tác', run: () => {
+      const restored = new Set(undoTransactions.map(item => item.transaction.id));
+      const nextTransactions = db.tx.slice();
+      undoTransactions.slice().sort((a, b) => a.index - b.index).forEach(item => {
+        if (nextTransactions.some(transaction => transaction.id === item.transaction.id)) return;
+        nextTransactions.splice(Math.min(item.index, nextTransactions.length), 0, item.transaction);
+      });
+      undoRecurringSkips.forEach(({ sourceId, period }) => {
+        const index = nextTransactions.findIndex(transaction => transaction.id === sourceId);
+        if (index < 0) return;
+        const source = { ...nextTransactions[index] };
+        source.skippedRecurringPeriods = (source.skippedRecurringPeriods || []).filter(item => item !== period);
+        if (!source.skippedRecurringPeriods.length) delete source.skippedRecurringPeriods;
+        nextTransactions[index] = source;
+      });
+      try {
+        write(TX_KEY, nextTransactions);
+        db.tx = nextTransactions;
+        clearTimeout(undoTimeout); undoTransactions = []; undoRecurringSkips = [];
+        refreshRows();
+        toast(`Đã khôi phục ${restored.size} giao dịch`);
+      } catch (error) {
+        console.error('Unable to restore deleted transactions', error);
+        toast('Không thể hoàn tác. Vui lòng kiểm tra bộ nhớ trình duyệt.', 4200);
+      }
+    } });
+  };
 
   /* ===== Báo lỗi trên ô nhập ===== */
   function showErr(form, errs) {
@@ -306,88 +572,375 @@
     ${field('pw2', 'Xác nhận mật khẩu', 'i-shield-halved', { type: 'password', attr: 'class="has-toggle" autocomplete="new-password"' })}
     <div class="actions" style="justify-content:space-between"><button type="button" class="btn-danger" data-act="delAcc">${ic('s-trash', 1)}XÓA TÀI KHOẢN</button><button class="btn-primary">CẬP NHẬT</button></div></form>`;
 
-  const canEditCat = c => isAdmin ? !c.owner : c.owner === session.email;
-  const canDelCat = c => isAdmin || c.owner === session.email;
-  const catPage = () => { const e = visCats().find(c => c.id === S.editCat && canEditCat(c)) || {}; return `
-    <form class="card" data-f="cat" novalidate><h2 class="card-title">${e.id ? 'SỬA' : isAdmin ? 'QUẢN LÝ' : 'THÊM'} DANH MỤC${isAdmin && !e.id ? ' MẶC ĐỊNH' : ''}</h2>
-      <div class="grid2">${field('cname', 'Tên danh mục', 'i-layer-group', { val: e.name })}${field('ctype', 'Loại', 's-swap', { tag: 'select', opts: opt(TYPES, e.type, 'Thu / Chi') })}</div>
-      ${field('cnote', 'Mô tả', 'i-receipt', { val: e.note })}
-      <div class="actions">${!isAdmin || e.id ? '<button type="button" class="btn-ghost-d" data-act="cancel">HỦY</button>' : ''}<button class="btn-primary">${isAdmin && !e.id ? 'THÊM' : 'LƯU'}</button></div></form>
-    <div class="card"><h2 class="card-title">${isAdmin ? 'DANH SÁCH DANH MỤC' : 'DANH MỤC CỦA TÔI'}</h2><div id="rows" class="category-menu"></div></div>`; };
+  const CATEGORY_ICONS = [['🍽️', 'Ăn uống'], ['🛒', 'Mua sắm'], ['🏠', 'Nhà cửa'], ['🚗', 'Di chuyển'], ['💊', 'Sức khỏe'], ['🎓', 'Học tập'], ['🎬', 'Giải trí'], ['💡', 'Hóa đơn'], ['💰', 'Thu nhập'], ['🎁', 'Quà tặng'], ['📦', 'Khác']];
+  const canEditCat = category => isAdmin ? !category.owner : category.scope === 'family'
+    ? canManageFamily(category.familyId)
+    : category.owner === session.email;
+  const canDelCat = category => isAdmin || (category.scope === 'family'
+    ? canManageFamily(category.familyId)
+    : category.owner === session.email);
+  const categoryScopeOf = category => category?.scope === 'family' ? category.familyId
+    : isGlobalCategory(category) ? 'global' : 'personal';
+  const categoryListForPage = () => {
+    const scope = S.catScope || (isAdmin ? 'global' : 'personal');
+    if (isAdmin && scope === 'personal') return db.cats.filter(category => category.owner && category.scope !== 'family');
+    return visCats(scope === 'global' ? 'global' : scope === 'personal' ? 'personal' : 'family',
+      ['global', 'personal'].includes(scope) ? '' : scope, true);
+  };
+  const categoryCanUse = (category, scope, familyId) => !!category && (isGlobalCategory(category) ||
+    (category.scope === 'family'
+      ? scope === 'family' && category.familyId === familyId && (isAdmin || !!familyMemberOf(familyId))
+      : scope === 'personal' && (isAdmin || category.owner === session.email)));
+  const catPage = () => {
+    const e = db.cats.find(category => category.id === S.editCat && canEditCat(category)) || {};
+    const memberships = myFamilyMemberships();
+    // Quản trị viên quản lý danh mục cho các gia đình đã tồn tại, dù không là thành viên.
+    const families = isAdmin ? db.families.map(family => [family.id, family.name])
+      : memberships.filter(member => canManageFamily(member.familyId)).map(member => [member.familyId, familyOf(member.familyId)?.name || 'Gia đình']);
+    const visibleFamilies = isAdmin ? db.families.map(family => [family.id, family.name])
+      : memberships.map(member => [member.familyId, familyOf(member.familyId)?.name || 'Gia đình']);
+    const selectedScope = S.catScope || (isAdmin ? 'global' : 'personal');
+    const categoryScope = e.id ? categoryScopeOf(e) : (families.some(([id]) => id === selectedScope)
+      ? selectedScope : isAdmin ? 'global' : 'personal');
+    const familyId = ['personal', 'global'].includes(categoryScope) ? '' : categoryScope;
+    const initialFamilyId = families.some(([id]) => id === familyId) ? familyId : (families[0]?.[0] || '');
+    const candidates = visCats(categoryScope === 'global' ? 'global' : categoryScope === 'personal' ? 'personal' : 'family', familyId)
+      .filter(category => categoryScopeOf(category) === categoryScope && category.type === (e.type || 'out') && !category.parentId && category.id !== e.id);
+    const used = db.tx.some(transaction => transaction.catId === e.id);
+    return `<div class="category-page">
+      <form class="card category-form" data-f="cat" novalidate>
+        <div class="category-form-heading"><div><span class="dashboard-eyebrow">${e.id ? 'CHỈNH SỬA CẤU TRÚC' : 'TÙY CHỈNH DANH MỤC'}</span><h2 class="card-title">${e.id ? 'CẬP NHẬT DANH MỤC' : 'TẠO DANH MỤC'}</h2></div><span class="category-preview" id="categoryPreview" style="--category-color:${categoryColor(e)}">${esc(e.icon || '📦')}<b>${esc(e.name || 'Tên danh mục')}</b></span></div>
+        <div class="grid2">${field('cname', 'Tên danh mục', 'i-layer-group', { val: e.name, attr: 'maxlength="60"' })}${field('ctype', 'Phân loại', 's-swap', { tag: 'select', opts: opt(TYPES, e.type || 'out') })}</div>
+        ${e.id ? `<input type="hidden" name="categoryScope" value="${esc(categoryScope === 'global' ? 'global' : categoryScope === 'personal' ? 'personal' : 'family')}"><input type="hidden" name="categoryFamilyId" value="${esc(familyId)}"><p class="category-scope-hint">Phạm vi danh mục không đổi sau khi tạo.${used ? ' Đang được giao dịch tham chiếu; lịch sử vẫn giữ nguyên.' : ''}</p>` : `<div class="grid2">${field('categoryScope', 'Phạm vi', 'i-users', { tag: 'select', opts: opt(isAdmin ? [['global', '🌐 Danh mục chung (cá nhân + gia đình)'], ...(families.length ? [['family', '🏠 Danh mục riêng một gia đình']] : [])] : [['personal', '🔒 Danh mục cá nhân'], ...(families.length ? [['family', '🏠 Danh mục gia đình']] : [])], categoryScope === 'personal' ? 'personal' : categoryScope === 'global' ? 'global' : 'family') })}<div id="categoryFamilyField"${categoryScope === 'personal' || categoryScope === 'global' ? ' hidden' : ''}>${field('categoryFamilyId', 'Gia đình áp dụng', 'i-users', { tag: 'select', opts: opt(families, initialFamilyId, 'Chọn gia đình') })}</div></div><div class="category-scope-help" id="categoryScopeHelp">🌐 Danh mục chung sử dụng được trong giao dịch cá nhân và gia đình. 🏠 Danh mục riêng chỉ dùng trong gia đình được chọn; giao dịch gia đình cần ví quỹ chung.</div>`}
+        <div class="grid2"><div class="field"><label for="cicon">Biểu tượng</label><select id="cicon" name="cicon">${CATEGORY_ICONS.map(([icon, label]) => `<option value="${esc(icon)}"${(e.icon || '📦') === icon ? ' selected' : ''}>${icon} ${esc(label)}</option>`).join('')}</select><span class="err-slot"><span class="error"><span></span></span></span></div>${field('ccolor', 'Màu sắc', 'i-layer-group', { type: 'color', val: categoryColor(e), attr: 'class="category-color-input"' })}</div>
+        ${field('cparent', 'Danh mục cha (không bắt buộc)', 'i-layer-group', { tag: 'select', opts: opt(candidates.map(category => [category.id, categoryName(category)]), e.parentId || '', 'Không có · danh mục cấp cao') })}
+        ${field('cnote', 'Mô tả', 'i-receipt', { val: e.note, attr: 'maxlength="240"' })}
+        <div class="category-form-note">Mỗi giao dịch chỉ gắn với một danh mục con/cụ thể. Thống kê tính theo mã danh mục của giao dịch, không cộng thêm lần nữa vào danh mục cha.</div>
+        <div class="actions">${!isAdmin || e.id ? '<button type="button" class="btn-ghost-d" data-act="cancel">HỦY</button>' : ''}<button class="btn-primary">${e.id ? 'LƯU THAY ĐỔI' : 'TẠO DANH MỤC'}</button></div>
+      </form>
+      <div class="card category-list-card"><div class="category-list-heading"><div><span class="dashboard-eyebrow">THƯ VIỆN DANH MỤC</span><h2 class="card-title">${isAdmin ? 'QUẢN LÝ DANH MỤC THEO PHẠM VI' : 'DANH MỤC CỦA BẠN'}</h2></div><select id="catScope" class="family-filter" data-live aria-label="Lọc danh mục theo phạm vi">${opt(isAdmin ? [['global', '🌐 Danh mục chung'], ['personal', 'Danh mục cá nhân'], ...visibleFamilies.map(([id, name]) => [id, `🏠 Gia đình · ${name}`])] : [['personal', 'Cá nhân + danh mục chung'], ...visibleFamilies.map(([id, name]) => [id, `Gia đình · ${name}`])], S.catScope || (isAdmin ? 'global' : 'personal'))}</select></div><div id="rows" class="category-grid"></div></div>
+    </div>`;
+  };
   const catRows = () => {
-    const categories = visCats();
+    const categories = categoryListForPage();
     if (!categories.length) return `<div class="empty-box">${NONE}</div>`;
-    const sections = new Map();
-    categories.forEach(c => {
-      const section = categorySection(c), family = categoryParts(c).family;
-      if (!sections.has(section)) sections.set(section, new Map());
-      const families = sections.get(section);
-      if (!families.has(family)) families.set(family, []);
-      families.get(family).push(c);
-    });
-    const sectionOrder = [...CATEGORY_SECTIONS.map(s => s.name), 'Thu nhập', 'Danh mục của tôi', 'Danh mục khác', ...Array.from(sections.keys()).sort((a, b) => a.localeCompare(b, 'vi'))];
-    return [...new Set(sectionOrder)].filter(section => sections.has(section)).map(section => {
-      const families = sections.get(section), count = [...families.values()].reduce((n, items) => n + items.length, 0);
-      const familyHtml = [...families.entries()].map(([family, items]) => `<section class="category-subgroup">${family ? `<h3>${esc(family)}</h3>` : ''}<div class="category-items">${items.map(c => {
-        const leaf = categoryParts(c).leaf;
-        return `<article class="category-item"><div class="category-item-main"><b>${esc(leaf)}</b><span class="badge ${c.type}">${c.type === 'in' ? 'Thu' : 'Chi'}</span>${isAdmin ? c.owner ? `<span class="category-owner">${esc(uname(c.owner))}</span>` : '<span class="badge admin">Mặc định</span>' : ''}${c.note ? `<small>${esc(c.note)}</small>` : ''}</div>
-          <div class="cell-act">${canEditCat(c) ? `<button class="sm" data-act="editCat" data-id="${esc(c.id)}">${ic('i-pen-to-square')}Sửa</button>` : ''}${canDelCat(c) ? `<button class="sm red" data-act="delCat" data-id="${esc(c.id)}">${ic('s-trash', 1)}Xóa</button>` : !canEditCat(c) ? '<span class="badge admin">Mặc định</span>' : ''}</div></article>`;
-      }).join('')}</div></section>`).join('');
-      return `<details class="category-menu-group"><summary><span>${esc(section)}</span><small>${count} danh mục</small></summary><div class="category-menu-content">${familyHtml}</div></details>`;
+    return categories.map(category => {
+      const children = db.cats.filter(child => child.parentId === category.id && !child.hidden);
+      const parent = category.parentId ? catOf(category.parentId) : null;
+      const legacyParts = !category.parentId ? categoryParts(category) : null;
+      const displayName = category.parentId ? category.name : legacyParts.leaf;
+      const parentLabel = parent ? categoryName(parent) : legacyParts?.family || '';
+      const categoryScope = categoryScopeOf(category);
+      const label = categoryScope === 'global' ? '🌐 Dùng chung cho cá nhân và gia đình'
+        : categoryScope === 'personal' ? '🔒 Cá nhân' : `🏠 Gia đình · ${familyOf(category.familyId)?.name || 'Gia đình'}`;
+      const kind = isAdmin && category.owner ? `${label} · ${uname(category.owner)}` : label;
+      return `<article class="category-card ${category.parentId ? 'is-child' : ''} ${category.hidden ? 'is-hidden' : ''}" style="--category-color:${categoryColor(category)}">
+        ${category.parentId ? '<span class="category-tree-branch" aria-hidden="true">↳</span>' : ''}
+        <span class="category-card-icon">${esc(category.icon || '📦')}</span><div class="category-card-copy"><div><strong>${esc(displayName)}</strong><span class="badge ${category.type}">${category.type === 'in' ? 'Thu nhập' : 'Chi tiêu'}</span>${category.hidden ? '<span class="category-hidden-tag">Đã ẩn</span>' : ''}</div>
+          <small>${parentLabel ? `Thuộc ${esc(parentLabel)} · ` : ''}${esc(kind)}${children.length ? ` · ${children.length} danh mục con` : ''}</small>${category.note ? `<p>${esc(category.note)}</p>` : ''}
+        </div><div class="category-card-actions">${canEditCat(category) ? `<button type="button" class="sm" data-act="editCat" data-id="${esc(category.id)}">Sửa</button><button type="button" class="sm" data-act="${category.hidden ? 'showCat' : 'hideCat'}" data-id="${esc(category.id)}">${category.hidden ? 'Hiện' : 'Ẩn'}</button>` : isAdmin && !category.owner ? '<span class="badge admin">Mặc định</span>' : category.scope === 'family' && !canManageFamily(category.familyId) ? '<span class="badge admin">Chỉ xem</span>' : ''}${canDelCat(category) ? `<button type="button" class="sm red" data-act="delCat" data-id="${esc(category.id)}">Xóa</button>` : ''}</div></article>`;
     }).join('');
+  };
+  const updateCategoryParentOptions = form => {
+    const parentSelect = form?.elements.cparent;
+    if (!parentSelect) return;
+    const categoryScope = form.elements.categoryScope?.value || (S.editCat ? categoryScopeOf(catOf(S.editCat)) : 'personal');
+    const familyId = categoryScope === 'family' ? (form.elements.categoryFamilyId?.value || catOf(S.editCat)?.familyId || '') : '';
+    const type = form.elements.ctype?.value || 'out';
+    const current = parentSelect.value || catOf(S.editCat)?.parentId || '';
+    const candidates = visCats(categoryScope === 'family' ? 'family' : categoryScope === 'global' ? 'global' : 'personal', familyId, true)
+      .filter(category => categoryScopeOf(category) === (categoryScope === 'family' ? familyId : categoryScope)
+        && !category.parentId && category.type === type && category.id !== S.editCat
+        && (!category.hidden || category.id === current));
+    const currentValid = candidates.some(category => category.id === current);
+    parentSelect.innerHTML = opt(candidates.map(category => [category.id, categoryName(category)]), currentValid ? current : '', 'Không có · danh mục cấp cao');
+  };
+  const updateTransactionCategoryOptions = form => {
+    const category = form?.elements.cat;
+    if (!category) return;
+    const scope = form.elements.scope?.value === 'family' ? 'family' : 'personal';
+    const familyId = scope === 'family' ? (form.elements.familyId?.value || activeFamilyId()) : '';
+    const editing = db.tx.find(transaction => transaction.id === S.editTx);
+    category.innerHTML = catOpts(category.value, 'Chọn danh mục', form.elements.type?.value || 'out', [editing && catOf(editing.catId)], scope, familyId);
   };
 
   const filterTx = () => {
     const q = (S.q || '').toLowerCase();
     const f = isAdmin ? { u: S.au, t: S.at, c: S.ac, from: S.af, to: S.ae } : { t: S.ft, c: S.fc, from: S.fd, to: S.td };
     const k = S.sk || 'date', d = (S.sd || 'desc') === 'asc' ? 1 : -1;
-    return myTx().filter(t => (!q || ((t.note || '') + ' ' + cname(t) + ' ' + t.amount + ' ' + Number(t.amount).toLocaleString('vi-VN') + ' ' + accountLabel(t.accountId || t.account) + ' ' + paymentLabel(t.paymentMethod)).toLowerCase().includes(q)) && (!f.u || t.owner === f.u) && (!f.t || t.type === f.t) &&
-      (!f.c || t.catId === f.c) && (!S.fp || isAdmin || t.paymentMethod === S.fp) && (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to))
+    return myTx().filter(t => (!q || ((t.note || '') + ' ' + (t.description || '') + ' ' + cname(t) + ' ' + t.amount + ' ' + Number(t.amount).toLocaleString('vi-VN') + ' ' + accountLabel(t.accountId || t.account) + ' ' + accountLabel(t.toAccountId) + ' ' + paymentLabel(t.paymentMethod) + ' ' + uname(t.owner)).toLowerCase().includes(q)) && (!f.u || t.owner === f.u) && (!f.t || t.type === f.t) &&
+      (!f.c || t.catId === f.c) && (!S.fp || isAdmin || t.paymentMethod === S.fp) && (!S.fw || (t.accountId || t.account) === S.fw || t.toAccountId === S.fw) &&
+      (!S.fm || t.owner === S.fm) && (!S.fmin || Number(t.amount) >= Number(S.fmin)) && (!S.fmax || Number(t.amount) <= Number(S.fmax)) &&
+      (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to))
       .sort((a, b) => d * (k === 'amount' ? a.amount - b.amount : a.date.localeCompare(b.date)));
   };
-  const txSummary = () => { const list = filterTx(); return `<div class="stats tx-summary">${stat('Giao dịch', list.length, 'i-receipt', n => n)}${stat('Tổng thu', sum(list, 'in'), 'i-coins')}${stat('Tổng chi', sum(list, 'out'), 'i-piggy-bank')}${stat('Chênh lệch', sum(list, 'in') - sum(list, 'out'), 'i-wallet')}</div>`; };
+  const txSummary = () => { const list = filterTx(); return `<div class="stats tx-summary">${stat('Giao dịch', list.length, 'i-receipt', n => n)}${stat('Tổng thu', sum(list, 'in'), 'i-coins')}${stat('Tổng chi', sum(list, 'out'), 'i-piggy-bank')}${stat('Chuyển ví nội bộ', list.filter(transaction => transaction.type === 'transfer').length, 'i-wallet', n => n)}${stat('Chênh lệch thu chi', sum(list, 'in') - sum(list, 'out'), 'i-wallet')}</div>`; };
   const txRows = () => {
     const pl = paged(filterTx()); PAGE_IDS = pl.map(t => t.id);
-    return pl.map((t, i) => `<tr>${isAdmin ? '' : `<td><input type="checkbox" class="chk" data-act="selTx" data-id="${esc(t.id)}" aria-label="Chọn giao dịch" ${(S.sel || []).includes(t.id) ? 'checked' : ''}></td>`}<td>${PG.off + i + 1}</td>${isAdmin ? `<td>${esc(uname(t.owner))}</td>` : ''}<td><span class="badge ${t.type}">${t.type === 'in' ? 'Thu' : 'Chi'}</span></td>
-      <td class="${t.type === 'in' ? 'inc' : 'exp'}">${money(t.amount)}</td><td>${esc(cname(t))}</td><td>${fdate(t.date)}</td><td>${esc(accountLabel(t.accountId || t.account))}</td><td>${esc(paymentLabel(t.paymentMethod))}</td><td class="desc">${esc(t.note) || '—'}</td>
-      <td><div class="cell-act"><button class="sm" data-act="viewTx" data-id="${esc(t.id)}" aria-label="Xem chi tiết giao dịch">${ic('i-eye')}Xem</button>${isAdmin ? '' : `<button class="sm" data-act="editTx" data-id="${esc(t.id)}">${ic('i-pen-to-square')}Sửa</button><button class="sm" data-act="copyTx" data-id="${esc(t.id)}">Sao chép</button>`}<button class="sm red" data-act="delTx" data-id="${esc(t.id)}">${ic('s-trash', 1)}Xóa</button></div></td></tr>`).join('') || emptyRow(10);
+    return pl.map((t, i) => `<tr>${isAdmin ? '' : `<td><input type="checkbox" class="chk" data-act="selTx" data-id="${esc(t.id)}" aria-label="Chọn giao dịch" ${(S.sel || []).includes(t.id) ? 'checked' : ''}></td>`}<td>${PG.off + i + 1}</td>${isAdmin ? `<td>${esc(uname(t.owner))}</td>` : ''}<td><span class="badge ${t.type}">${t.type === 'in' ? 'Thu' : t.type === 'out' ? 'Chi' : 'Chuyển ví'}</span></td>
+      <td class="${t.type === 'in' ? 'inc' : t.type === 'out' ? 'exp' : ''}">${money(t.amount)}</td><td>${t.type === 'transfer' ? `Chuyển đến ${esc(accountLabel(t.toAccountId))}` : esc(cname(t))}</td><td>${fdate(t.date)}</td><td>${esc(accountLabel(t.accountId || t.account))}</td><td>${esc(paymentLabel(t.paymentMethod))}</td><td class="desc">${esc(t.note) || '—'}${t.scope === 'family' ? '<small class="family-shared-label">Dùng chung</small>' : ''}${t.receipt ? ' · Có chứng từ' : ''}${t.recurrence === 'monthly' ? ' · Hàng tháng' : ''}</td>
+      <td><div class="cell-act"><button class="sm" data-act="viewTx" data-id="${esc(t.id)}" aria-label="Xem chi tiết giao dịch">${ic('i-eye')}Xem</button>${!isAdmin && canEditFamilyTransaction(t) ? `<button class="sm" data-act="editTx" data-id="${esc(t.id)}">${ic('i-pen-to-square')}Sửa</button>` : ''}${!isAdmin && t.owner === session.email ? `<button class="sm" data-act="copyTx" data-id="${esc(t.id)}">Sao chép</button>` : ''}${(isAdmin || canDeleteFamilyTransaction(t)) ? `<button class="sm red" data-act="delTx" data-id="${esc(t.id)}">${ic('s-trash', 1)}Xóa</button>` : ''}</div></td></tr>`).join('') || emptyRow(10);
   };
-  const miniTable = l => `<div class="wrap"><table><thead><tr><th>Loại</th><th>Số tiền</th><th>Danh mục</th><th>Ngày</th><th>Mô tả</th></tr></thead><tbody>${l.map(t =>
-    `<tr><td><span class="badge ${t.type}">${t.type === 'in' ? 'Thu' : 'Chi'}</span></td><td class="${t.type === 'in' ? 'inc' : 'exp'}">${money(t.amount)}</td><td>${esc(cname(t))}</td><td>${fdate(t.date)}</td><td class="desc">${esc(t.note) || '—'}</td></tr>`).join('') || emptyRow(5)}</tbody></table></div>`;
+  const miniTable = l => `<div class="wrap"><table><thead><tr><th>Loại</th><th>Số tiền</th><th>Danh mục / Ví nhận</th><th>Ngày</th><th>Mô tả</th></tr></thead><tbody>${l.map(t =>
+    `<tr><td><span class="badge ${t.type}">${t.type === 'in' ? 'Thu' : t.type === 'out' ? 'Chi' : 'Chuyển ví'}</span></td><td class="${t.type === 'in' ? 'inc' : t.type === 'out' ? 'exp' : ''}">${money(t.amount)}</td><td>${t.type === 'transfer' ? `Chuyển đến ${esc(accountLabel(t.toAccountId))}` : esc(cname(t))}</td><td>${fdate(t.date)}</td><td class="desc">${esc(t.note) || '—'}</td></tr>`).join('') || emptyRow(5)}</tbody></table></div>`;
   const recent = (l, n = 5) => l.slice().sort((a, b) => b.date.localeCompare(a.date)).slice(0, n);
 
   /* ----- Báo cáo ----- */
-  const reportList = () => myTx().filter(t => (!S.rf || t.date >= S.rf) && (!S.rt || t.date <= S.rt) && (!S.rc || t.catId === S.rc) &&
-    (isAdmin ? !S.ru || t.owner === S.ru : !S.rty || t.type === S.rty));
-  const reportPage = () => `<form class="card noprint" data-f="report" novalidate><h2 class="card-title">${isAdmin ? 'BÁO CÁO HỆ THỐNG' : 'BÁO CÁO CHI TIÊU'}</h2>
-    <div class="grid2">${field('rf', 'Từ ngày', 's-cal', { type: 'date', val: S.rf })}${field('rt', 'Đến ngày', 's-cal', { type: 'date', val: S.rt })}
-    ${isAdmin ? field('ru', 'Người dùng', 'i-users', { tag: 'select', opts: opt(db.users.map(u => [u.email, u.name]), S.ru, 'Tất cả') }) : field('rty', 'Loại', 's-swap', { tag: 'select', opts: opt(TYPES, S.rty, 'Tất cả') })}
-    ${field('rc', 'Danh mục', 'i-layer-group', { tag: 'select', opts: catOpts(S.rc, 'Tất cả') })}</div>
-    <div class="actions"><button type="button" class="btn-ghost-d" data-act="repRange" data-id="month">THÁNG NÀY</button><button type="button" class="btn-ghost-d" data-act="repRange" data-id="year">NĂM NAY</button><button type="button" class="btn-ghost-d" data-act="repRange" data-id="reset">ĐẶT LẠI</button>
-    <button class="btn-primary">${ic('i-chart-pie')}XEM BÁO CÁO</button></div></form>
-    <div class="card"><div class="card-head"><h2 class="card-title">KẾT QUẢ</h2><div class="head-act noprint">
-      <button type="button" class="sm" data-act="rv" data-id="bar">Cột</button><button type="button" class="sm" data-act="rv" data-id="pie">Tròn</button>
-      <button type="button" class="sm" data-act="exportRep">${ic('s-download', 1)}XUẤT CSV</button><button type="button" class="sm" data-act="printRep">${ic('s-print', 1)}IN / LƯU PDF</button></div></div>
-      <div id="repOut">${S.rrun ? reportOut() : chartEmpty()}</div></div>`;
-  const monthTable = l => { const m = {};
-    l.forEach(t => { const k = t.date.slice(0, 7); (m[k] = m[k] || { i: 0, o: 0 })[t.type === 'in' ? 'i' : 'o'] += t.amount; });
-    return `<div class="wrap"><table><thead><tr><th>Tháng</th><th>Thu</th><th>Chi</th><th>Số dư</th></tr></thead><tbody>${Object.keys(m).sort().reverse().map(k =>
-      `<tr><td>${k.slice(5)}/${k.slice(0, 4)}</td><td class="inc">${money(m[k].i)}</td><td class="exp">${money(m[k].o)}</td><td>${money(m[k].i - m[k].o)}</td></tr>`).join('')}</tbody></table></div>`; };
-  const userTable = l => { const m = {};
-    l.forEach(t => { (m[t.owner] = m[t.owner] || { n: 0, i: 0, o: 0 }).n++; m[t.owner][t.type === 'in' ? 'i' : 'o'] += t.amount; });
-    return `<div class="wrap"><table><thead><tr><th>Người dùng</th><th>Số giao dịch</th><th>Thu</th><th>Chi</th><th>Số dư</th></tr></thead><tbody>${Object.entries(m).sort((a, b) => b[1].o - a[1].o).map(([e, v]) =>
-      `<tr><td>${esc(uname(e))}</td><td>${v.n}</td><td class="inc">${money(v.i)}</td><td class="exp">${money(v.o)}</td><td>${money(v.i - v.o)}</td></tr>`).join('')}</tbody></table></div>`; };
+  const REPORT_PERIODS = [['day', 'Ngày'], ['week', 'Tuần'], ['month', 'Tháng'], ['quarter', 'Quý'], ['year', 'Năm'], ['custom', 'Khoảng tùy chọn'], ['all', 'Toàn bộ thời gian']];
+  const reportDate = (year, month, day) => `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  const validReportDate = value => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return false;
+    const [year, month, day] = value.split('-').map(Number);
+    return reportDate(year, month, day) === value && month >= 1 && month <= 12 && day >= 1 && day <= new Date(year, month, 0).getDate();
+  };
+  const reportShiftDate = (value, days) => {
+    const [year, month, day] = value.split('-').map(Number), date = new Date(year, month - 1, day + days);
+    return reportDate(date.getFullYear(), date.getMonth() + 1, date.getDate());
+  };
+  const reportRange = (period, anchor = today()) => {
+    const [year, month, day] = anchor.split('-').map(Number);
+    if (period === 'all') return ['', ''];
+    if (period === 'day') return [anchor, anchor];
+    if (period === 'week') {
+      const weekday = new Date(year, month - 1, day).getDay(), offset = weekday === 0 ? -6 : 1 - weekday;
+      const start = reportShiftDate(anchor, offset);
+      return [start, reportShiftDate(start, 6)];
+    }
+    if (period === 'quarter') {
+      const firstMonth = Math.floor((month - 1) / 3) * 3 + 1;
+      return [reportDate(year, firstMonth, 1), reportDate(year, firstMonth + 2, new Date(year, firstMonth + 2, 0).getDate())];
+    }
+    if (period === 'year') return [reportDate(year, 1, 1), reportDate(year, 12, 31)];
+    if (period === 'month') return [reportDate(year, month, 1), reportDate(year, month, new Date(year, month, 0).getDate())];
+    return ['', ''];
+  };
+  const reportFamilyOptions = () => isAdmin
+    ? db.families.map(family => [family.id, family.name])
+    : myFamilyMemberships().map(member => familyOf(member.familyId)).filter(Boolean).map(family => [family.id, family.name]);
+  const reportScopeOptions = () => isAdmin
+    ? [['all', 'Toàn hệ thống'], ['personal', 'Giao dịch cá nhân'], ...reportFamilyOptions().map(([id, name]) => [id, `Gia đình · ${name}`])]
+    : [['personal', 'Cá nhân'], ...reportFamilyOptions().map(([id, name]) => [id, `Gia đình · ${name}`])];
+  const reportAccounts = (scope = S.reportScope || (isAdmin ? 'all' : 'personal')) => {
+    const accounts = scope === 'all' ? db.accounts : scope === 'personal' ? (isAdmin
+      ? db.accounts.filter(account => !accountIsFamily(account)) : myAccounts())
+      : isAdmin ? db.accounts.filter(account => accountIsFamily(account) && account.familyId === scope)
+        : familyAccounts(scope);
+    return accounts.filter(account => isAdmin || accountCanUse(account));
+  };
+  const reportBaseTransactions = () => {
+    const scope = S.reportScope || (isAdmin ? 'all' : 'personal');
+    if (isAdmin) return db.tx.filter(transaction => scope === 'all'
+      || (scope === 'personal' ? transaction.scope !== 'family' : transaction.scope === 'family' && transaction.familyId === scope));
+    if (scope === 'personal') return db.tx.filter(transaction => transaction.owner === session.email && transaction.scope !== 'family');
+    if (!myFamilyMemberships().some(member => member.familyId === scope)) return [];
+    return db.tx.filter(transaction => transaction.scope === 'family' && transaction.familyId === scope);
+  };
+  const reportList = (start = S.rf, end = S.rt, filters = true) => reportBaseTransactions().filter(transaction =>
+    (!start || transaction.date >= start) && (!end || transaction.date <= end)
+    && (!filters || !S.rc || transaction.catId === S.rc)
+    && (!filters || !S.rty || transaction.type === S.rty)
+    && (!filters || !S.ru || transaction.owner === S.ru)
+    && (!filters || !S.rmember || transaction.owner === S.rmember)
+    && (!filters || !S.raccount || transaction.accountId === S.raccount || transaction.toAccountId === S.raccount || transaction.account === S.raccount));
+  const reportPage = () => {
+    if (!S.rperiod) S.rperiod = 'month';
+    if (!S.rf && !S.rt) [S.rf, S.rt] = reportRange(S.rperiod);
+    if (!S.reportScope) S.reportScope = isAdmin ? 'all' : 'personal';
+    const scope = S.reportScope, familyScope = scope !== 'personal' && scope !== 'all';
+    const familyMembers = familyScope ? familyMembersOf(scope).map(member => [member.userEmail, uname(member.userEmail)]) : [];
+    const categoryScope = familyScope ? 'family' : isAdmin ? 'all' : 'personal';
+    const categories = categoryScope === 'family' ? catOpts(S.rc, 'Tất cả', undefined, [], 'family', scope)
+      : catOpts(S.rc, 'Tất cả', undefined, [], categoryScope);
+    return `<div class="report-page">
+      <form class="card report-filter-card noprint" data-f="report" novalidate>
+        <div class="report-title-row"><div><span class="dashboard-eyebrow">PHÂN TÍCH DÒNG TIỀN</span><h2 class="card-title">${isAdmin ? 'BÁO CÁO HỆ THỐNG' : 'BÁO CÁO TÀI CHÍNH'}</h2></div><span class="report-update-pill">${ic('i-chart-pie')} Dữ liệu cục bộ · ${reportBaseTransactions().length} giao dịch</span></div>
+        <div class="report-filter-grid">
+          ${field('rperiod', 'Kỳ báo cáo', 's-cal', { tag: 'select', opts: opt(REPORT_PERIODS, S.rperiod) })}
+          ${field('reportScope', 'Phạm vi báo cáo', 'i-users', { tag: 'select', opts: opt(reportScopeOptions(), scope) })}
+          <div id="reportStartField">${field('rf', 'Từ ngày', 's-cal', { type: 'date', val: S.rf })}</div><div id="reportEndField">${field('rt', 'Đến ngày', 's-cal', { type: 'date', val: S.rt })}</div>
+          ${field('raccount', 'Ví / tài khoản', 'i-wallet', { tag: 'select', opts: opt(reportAccounts().map(account => [account.id, `${account.name}${accountIsFamily(account) ? ' · Quỹ chung' : ''}`]), S.raccount, 'Tất cả ví') })}
+          ${familyScope ? field('rmember', 'Thành viên', 'i-users', { tag: 'select', opts: opt(familyMembers, S.rmember, 'Tất cả thành viên') }) : isAdmin && scope === 'all' ? field('ru', 'Người dùng', 'i-users', { tag: 'select', opts: opt(db.users.map(user => [user.email, user.name]), S.ru, 'Tất cả người dùng') }) : ''}
+          ${field('rty', 'Loại giao dịch', 's-swap', { tag: 'select', opts: opt(TRANSACTION_TYPES, S.rty, 'Tất cả loại') })}
+          ${field('rc', 'Danh mục', 'i-layer-group', { tag: 'select', opts: categories })}
+        </div>
+        <div class="report-filter-actions"><div class="report-quick-ranges"><button type="button" class="sm" data-act="repRange" data-id="day">Hôm nay</button><button type="button" class="sm" data-act="repRange" data-id="week">Tuần này</button><button type="button" class="sm" data-act="repRange" data-id="month">Tháng này</button><button type="button" class="sm" data-act="repRange" data-id="quarter">Quý này</button><button type="button" class="sm" data-act="repRange" data-id="year">Năm nay</button><button type="button" class="sm" data-act="repRange" data-id="reset">Đặt lại</button></div>
+          <button class="btn-primary">${ic('i-chart-pie')}TẠO BÁO CÁO</button></div>
+      </form>
+      <section class="card report-result-card"><div class="card-head"><div><span class="dashboard-eyebrow">TỔNG HỢP KỲ ĐÃ CHỌN</span><h2 class="card-title">KẾT QUẢ BÁO CÁO</h2></div><div class="head-act noprint">
+        <button type="button" class="sm" data-act="rv" data-id="bar">Cột</button><button type="button" class="sm" data-act="rv" data-id="pie">Tròn</button>
+        <button type="button" class="sm" data-act="exportRep" data-id="xls">Excel</button><button type="button" class="sm" data-act="exportRep" data-id="csv">CSV</button><button type="button" class="sm" data-act="printRep">${ic('s-print', 1)}PDF / In</button></div></div>
+        <div id="repOut">${S.rrun ? reportOut() : chartEmpty('Chọn kỳ và phạm vi, sau đó tạo báo cáo')}</div></section>
+    </div>`;
+  };
+  const reportCategoryRows = transactions => {
+    const categories = transactions.filter(transaction => ['in', 'out'].includes(transaction.type)).reduce((map, transaction) => {
+      const key = `${transaction.type}:${transaction.catId || 'none'}`;
+      const item = map.get(key) || { name: transaction.catId ? cname(transaction) : 'Chưa phân loại', type: transaction.type, amount: 0, count: 0 };
+      item.amount += Number(transaction.amount || 0); item.count++; map.set(key, item); return map;
+    }, new Map());
+    return [...categories.values()].sort((a, b) => b.amount - a.amount);
+  };
+  const reportBudgetRows = transactions => {
+    const scope = S.reportScope || (isAdmin ? 'all' : 'personal');
+    const months = [];
+    if (S.rf && S.rt) {
+      let cursor = S.rf.slice(0, 7), last = S.rt.slice(0, 7);
+      while (cursor <= last && months.length < 240) { months.push(cursor); cursor = shiftMonth(cursor, 1); }
+    } else months.push(...new Set(transactions.map(transaction => transaction.date.slice(0, 7))));
+    if (scope === 'personal' || (isAdmin && scope === 'all')) {
+      const owners = isAdmin ? (S.ru ? [S.ru] : db.users.map(user => user.email)) : [session.email];
+      if (!S.rf && !S.rt) months.push(...new Set(db.budgets.filter(budget => owners.includes(budget.owner)).map(budget => budget.month)));
+      const selectedMonths = [...new Set(months)].sort();
+      return db.budgets.filter(budget => owners.includes(budget.owner) && selectedMonths.includes(budget.month)
+        && (!S.rc || budget.catId === S.rc)).map(budget => {
+        const spent = transactions.filter(transaction => transaction.scope !== 'family' && transaction.owner === budget.owner
+          && transaction.type === 'out' && transaction.date.startsWith(budget.month) && transaction.catId === budget.catId)
+          .reduce((total, transaction) => total + Number(transaction.amount || 0), 0);
+        return { period: budget.month, name: `${catOf(budget.catId)?.name || 'Danh mục đã xóa'}${owners.length > 1 ? ` · ${uname(budget.owner)}` : ''}`, budget: Number(budget.amount || 0), actual: spent };
+      });
+    }
+    const family = familyOf(scope);
+    if (!S.rf && !S.rt) months.push(...db.budgets.filter(budget => budget.scope === 'family' && budget.familyId === family?.id).map(budget => budget.month));
+    if (!months.length && !S.rf && !S.rt) months.push(monthNow());
+    const selectedMonths = [...new Set(months)];
+    const familyEntries = db.budgets.filter(budget => budget.scope === 'family' && budget.familyId === family?.id
+      && selectedMonths.includes(budget.month) && (!S.rc || budget.catId === S.rc));
+    const rows = !S.rc && family?.monthlyBudget ? selectedMonths.map(month => {
+      const actual = transactions.filter(transaction => transaction.type === 'out' && transaction.date.startsWith(month))
+        .reduce((total, transaction) => total + Number(transaction.amount || 0), 0);
+      return { period: month, name: 'Ngân sách gia đình', budget: Number(family.monthlyBudget), actual };
+    }) : [];
+    return [...rows, ...familyEntries.map(budget => {
+      const actual = transactions.filter(transaction => transaction.type === 'out' && transaction.date.startsWith(budget.month)
+        && transaction.catId === budget.catId).reduce((total, transaction) => total + Number(transaction.amount || 0), 0);
+      return { period: budget.month, name: `${catOf(budget.catId)?.name || 'Danh mục đã xóa'} · Ngân sách gia đình`, budget: Number(budget.amount || 0), actual };
+    })];
+  };
+  const reportBalanceDelta = (transactions, start, end) => {
+    const account = S.raccount && db.accounts.find(item => item.id === S.raccount);
+    const transactionDelta = transactions.reduce((total, transaction) => {
+      if (account) return total + accountTransactionDelta(account, transaction);
+      if (transaction.type === 'transfer') return total;
+      return total + (transaction.type === 'in' ? Number(transaction.amount || 0) : transaction.type === 'out' ? -Number(transaction.amount || 0) : 0);
+    }, 0);
+    return transactionDelta + db.accountAdjustments.filter(adjustment => {
+      const account = db.accounts.find(item => item.id === adjustment.accountId);
+      if (!account || (S.raccount && account.id !== S.raccount)
+        || (S.ru && adjustment.owner !== S.ru) || (S.rmember && adjustment.owner !== S.rmember)) return false;
+      const scope = S.reportScope || (isAdmin ? 'all' : 'personal');
+      return scope === 'all' || (scope === 'personal' ? !accountIsFamily(account) && (isAdmin || account.owner === session.email)
+        : accountIsFamily(account) && account.familyId === scope);
+    }).filter(adjustment => {
+      const day = (adjustment.createdAt || '').slice(0, 10);
+      return (!start || day >= start) && (!end || day <= end);
+    }).reduce((total, adjustment) => total + Number(adjustment.delta || 0), 0);
+  };
+  const reportComparison = transactions => {
+    if (!S.rf || !S.rt) return [];
+    const duration = Math.max(1, Math.round((new Date(`${S.rt}T00:00:00`) - new Date(`${S.rf}T00:00:00`)) / 86400000) + 1);
+    const previousEnd = reportShiftDate(S.rf, -1), previousStart = reportShiftDate(previousEnd, -(duration - 1));
+    const previous = reportList(previousStart, previousEnd, true);
+    return [
+      { label: 'Thu', current: sum(transactions, 'in'), previous: sum(previous, 'in') },
+      { label: 'Chi', current: sum(transactions, 'out'), previous: sum(previous, 'out') },
+      { label: 'Dòng tiền ròng', current: sum(transactions, 'in') - sum(transactions, 'out'), previous: sum(previous, 'in') - sum(previous, 'out') }
+    ];
+  };
+  const reportTrendRows = transactions => {
+    const buckets = new Map();
+    const dayCount = S.rf && S.rt
+      ? Math.round((new Date(`${S.rt}T00:00:00`) - new Date(`${S.rf}T00:00:00`)) / 86400000) + 1
+      : Infinity;
+    const byDay = ['day', 'week', 'month'].includes(S.rperiod) || (S.rperiod === 'custom' && dayCount <= 31);
+    transactions.filter(transaction => ['in', 'out'].includes(transaction.type)).forEach(transaction => {
+      const period = byDay ? transaction.date : transaction.date.slice(0, 7);
+      const entry = buckets.get(period) || { income: 0, expense: 0 };
+      entry[transaction.type === 'in' ? 'income' : 'expense'] += Number(transaction.amount || 0); buckets.set(period, entry);
+    });
+    return [...buckets.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([period, values]) => ({
+      period: byDay ? `${period.slice(8, 10)}/${period.slice(5, 7)}` : `${period.slice(5, 7)}/${period.slice(0, 4)}`,
+      ...values, delta: values.income - values.expense
+    }));
+  };
+  const reportPercentChange = (current, previous) => previous ? `${((current - previous) / Math.abs(previous) * 100).toLocaleString('vi-VN', { maximumFractionDigits: 1 })}%`
+    : current ? 'Mới phát sinh' : '—';
+  const reportComparisonHtml = rows => rows.length ? `<div class="wrap"><table><thead><tr><th>Chỉ số</th><th>Kỳ này</th><th>Kỳ trước</th><th>Chênh lệch</th><th>Thay đổi</th></tr></thead><tbody>${rows.map(row => {
+    const delta = row.current - row.previous;
+    return `<tr><td>${esc(row.label)}</td><td>${money(row.current)}</td><td>${money(row.previous)}</td><td class="${delta >= 0 ? 'inc' : 'exp'}">${delta > 0 ? '+' : ''}${money(delta)}</td><td>${reportPercentChange(row.current, row.previous)}</td></tr>`;
+  }).join('')}</tbody></table></div>` : chartEmpty('Chọn khoảng ngày cụ thể để so sánh với kỳ liền trước');
+  const reportTrendHtml = rows => rows.length ? `<div class="report-trend">${(() => {
+    const max = Math.max(...rows.map(item => Math.max(item.income, item.expense)), 1);
+    return rows.map((row, index) => {
+    return `<article class="report-trend-row" style="--chart-delay:${Math.min(index, 10) * 35}ms"><span>${esc(row.period)}</span><div class="report-trend-bars"><i class="in" style="--bar-width:${Math.max(0, row.income / max * 100)}%"></i><i class="out" style="--bar-width:${Math.max(0, row.expense / max * 100)}%"></i></div><small><b class="inc">${money(row.income)}</b><b class="exp">${money(row.expense)}</b><b class="${row.delta >= 0 ? 'inc' : 'exp'}">${money(row.delta)}</b></small></article>`;
+    }).join('');
+  })()}<div class="report-trend-legend"><span><i class="in"></i>Thu</span><span><i class="out"></i>Chi</span><span>Dòng tiền ròng</span></div></div>` : chartEmpty('Chưa có dữ liệu xu hướng trong kỳ');
+  const reportBudgetsHtml = rows => rows.length ? `<div class="wrap"><table><thead><tr><th>Kỳ</th><th>Danh mục / hạn mức</th><th>Dự kiến</th><th>Thực tế</th><th>Chênh lệch</th><th>Mức dùng</th></tr></thead><tbody>${rows.map(row => {
+    const delta = row.budget - row.actual, ratio = row.budget ? Math.round(row.actual / row.budget * 100) : 0;
+    return `<tr><td>${esc(row.period)}</td><td>${esc(row.name)}</td><td>${money(row.budget)}</td><td class="${ratio >= 100 ? 'exp' : ''}">${money(row.actual)}</td><td class="${delta >= 0 ? 'inc' : 'exp'}">${delta < 0 ? '-' : ''}${money(Math.abs(delta))}</td><td><span class="badge ${ratio >= 100 ? 'out' : ratio >= 80 ? 'warn' : 'ok'}">${ratio}%</span></td></tr>`;
+  }).join('')}</tbody></table></div>` : chartEmpty('Chưa có ngân sách cho phạm vi và kỳ đã chọn');
+  const reportExportRows = transactions => {
+    const rows = [['BÁO CÁO TÀI CHÍNH'], ['Phạm vi', reportScopeOptions().find(([id]) => id === S.reportScope)?.[1] || 'Cá nhân'], ['Từ ngày', S.rf || ''], ['Đến ngày', S.rt || ''], ['Cập nhật lúc', new Date().toLocaleString('vi-VN')], [],
+      ['Tổng quan', 'Số tiền'], ['Tổng thu', sum(transactions, 'in')], ['Tổng chi', sum(transactions, 'out')], ['Dòng tiền ròng', sum(transactions, 'in') - sum(transactions, 'out')], ['Biến động số dư theo giao dịch', reportBalanceDelta(transactions, S.rf, S.rt)], [],
+      ['Top danh mục', 'Loại', 'Số giao dịch', 'Tổng tiền'], ...reportCategoryRows(transactions).slice(0, 5).map(row => [row.name, row.type === 'in' ? 'Thu' : 'Chi', row.count, row.amount]), [],
+      ['So sánh kỳ', 'Kỳ này', 'Kỳ trước', 'Chênh lệch', 'Thay đổi'], ...reportComparison(transactions).map(row => [row.label, row.current, row.previous, row.current - row.previous, reportPercentChange(row.current, row.previous)]), [],
+      ['Xu hướng dòng tiền', 'Thu', 'Chi', 'Dòng tiền ròng'], ...reportTrendRows(transactions).map(row => [row.period, row.income, row.expense, row.delta]), [],
+      ['Ngân sách', 'Danh mục', 'Dự kiến', 'Thực tế', 'Chênh lệch'], ...reportBudgetRows(transactions).map(row => [row.period, row.name, row.budget, row.actual, row.budget - row.actual]), [],
+      ['Giao dịch', 'Ngày', 'Loại', 'Số tiền', 'Danh mục / Ví nhận', 'Ví', 'Thành viên', 'Ghi chú'],
+      ...transactions.map(transaction => [transaction.date, transaction.type === 'in' ? 'Thu' : transaction.type === 'out' ? 'Chi' : 'Chuyển ví', Number(transaction.amount || 0), transaction.type === 'transfer' ? `${accountLabel(transaction.accountId)} → ${accountLabel(transaction.toAccountId)}` : cname(transaction), accountLabel(transaction.accountId || transaction.account), uname(transaction.owner), transaction.note || ''])];
+    return rows;
+  };
   function reportOut() {
-    const l = reportList();
-    if (!l.length) return chartEmpty();
-    const h = 'style="margin:14px 0 8px;font-size:14px;color:var(--muted)"';
-    return `<div class="sum"><span class="badge in">Thu: ${money(sum(l, 'in'))}</span><span class="badge out">Chi: ${money(sum(l, 'out'))}</span><span class="badge">Số dư: ${money(sum(l, 'in') - sum(l, 'out'))}</span></div>
-      <h3 ${h}>Thu theo danh mục</h3>${chart(by(l, 'in'))}<h3 ${h}>Chi theo danh mục</h3>${chart(by(l, 'out'), 'e')}
-      <h3 ${h}>Theo tháng</h3>${monthTable(l)}${isAdmin && !S.ru ? `<h3 ${h}>Theo người dùng</h3>${userTable(l)}` : ''}`;
+    const transactions = reportList(), income = sum(transactions, 'in'), expense = sum(transactions, 'out');
+    const comparison = reportComparison(transactions), categories = reportCategoryRows(transactions), expenses = categories.filter(category => category.type === 'out').slice(0, 5);
+    const budgets = reportBudgetRows(transactions), trend = reportTrendRows(transactions);
+    const balanceDelta = reportBalanceDelta(transactions, S.rf, S.rt);
+    const updatedAt = new Date().toLocaleString('vi-VN');
+    S.reportUpdatedAt = updatedAt;
+    const scopeLabel = reportScopeOptions().find(([id]) => id === S.reportScope)?.[1] || 'Cá nhân';
+    const h = 'class="report-section-title"';
+    return `<div class="report-meta"><span>${esc(scopeLabel)} · ${esc(S.rf || 'Toàn bộ thời gian')} → ${esc(S.rt || 'Hiện tại')}</span><span>Cập nhật dữ liệu: ${esc(updatedAt)}</span><span>${transactions.length} giao dịch</span></div>
+      <div class="report-summary-grid"><article><span>Tổng thu</span><strong class="inc">${money(income)}</strong></article><article><span>Tổng chi</span><strong class="exp">${money(expense)}</strong></article><article><span>Dòng tiền ròng</span><strong>${money(income - expense)}</strong></article><article><span>Biến động số dư</span><strong class="${balanceDelta >= 0 ? 'inc' : 'exp'}">${balanceDelta < 0 ? '-' : '+'}${money(Math.abs(balanceDelta))}</strong></article></div>
+      ${!transactions.length ? '<div class="chart-empty">Không có giao dịch phù hợp trong phạm vi đã chọn. Báo cáo ngân sách vẫn được hiển thị bên dưới.</div>' : ''}
+      <h3 ${h}>SO SÁNH VỚI KỲ LIỀN TRƯỚC</h3>${reportComparisonHtml(comparison)}
+      <div class="report-charts"><article class="card report-chart"><h3 ${h}>THU THEO DANH MỤC</h3>${chart(by(transactions, 'in'))}</article><article class="card report-chart"><h3 ${h}>CHI THEO DANH MỤC</h3>${chart(by(transactions, 'out'), 'e')}</article></div>
+      <h3 ${h}>TOP 5 DANH MỤC CHI TIÊU</h3>${expenses.length ? `<div class="report-top-categories">${expenses.map((row, index) => `<article><span>${index + 1}</span><strong>${esc(row.name)}</strong><small>${row.count} giao dịch</small><b>${money(row.amount)}</b></article>`).join('')}</div>` : chartEmpty('Chưa có khoản chi trong kỳ')}
+      <h3 ${h}>XU HƯỚNG THU, CHI VÀ DÒNG TIỀN</h3>${reportTrendHtml(trend)}
+      <h3 ${h}>NGÂN SÁCH DỰ KIẾN VÀ CHI TIÊU THỰC TẾ</h3><p class="report-note">Đối chiếu theo từng tháng trong kỳ; nếu chỉ chọn một phần tháng, số thực tế chỉ tính trong khoảng ngày đã lọc. Hạn mức gia đình dùng mức tháng hiện tại vì ứng dụng chưa lưu lịch sử thay đổi ngân sách.</p>${reportBudgetsHtml(budgets)}
+      ${isAdmin && !S.ru ? `<h3 ${h}>THEO NGƯỜI DÙNG</h3>${userTable(transactions)}` : ''}`;
+  }
+  const userTable = transactions => {
+    const totals = {};
+    transactions.forEach(transaction => {
+      const item = totals[transaction.owner] || (totals[transaction.owner] = { count: 0, income: 0, expense: 0 });
+      if (transaction.type === 'in') { item.income += Number(transaction.amount || 0); item.count++; }
+      if (transaction.type === 'out') { item.expense += Number(transaction.amount || 0); item.count++; }
+    });
+    const rows = Object.entries(totals).sort((a, b) => b[1].expense - a[1].expense);
+    return `<div class="wrap"><table><thead><tr><th>Người dùng</th><th>Giao dịch</th><th>Thu</th><th>Chi</th><th>Số dư ròng</th></tr></thead><tbody>${rows.map(([email, item]) =>
+      `<tr><td>${esc(uname(email))}</td><td>${item.count}</td><td class="inc">${money(item.income)}</td><td class="exp">${money(item.expense)}</td><td>${money(item.income - item.expense)}</td></tr>`).join('') || emptyRow(5)}</tbody></table></div>`;
+  };
+  function downloadExcel(name, rows) {
+    const xmlEscape = value => String(value ?? '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+    const body = rows.map(row => `<Row>${row.map(value => `<Cell><Data ss:Type="${typeof value === 'number' && Number.isFinite(value) ? 'Number' : 'String'}">${xmlEscape(value)}</Data></Cell>`).join('')}</Row>`).join('');
+    const xml = `<?xml version="1.0"?><Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Worksheet ss:Name="Báo cáo"><Table>${body}</Table></Worksheet></Workbook>`;
+    const url = URL.createObjectURL(new Blob([xml], { type: 'application/vnd.ms-excel;charset=utf-8' }));
+    const link = document.createElement('a'); link.href = url; link.download = name; document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
   }
 
   /* ----- Dashboard ----- */
   const dashboardMonthLabel = value => monthRe.test(value || '') ? `THÁNG ${value.slice(5, 7)}/${value.slice(0, 4)}` : 'TẤT CẢ THỜI GIAN';
+  const dashboardAccountOptions = () => (S.dashboardScope && S.dashboardScope !== 'personal' ? familyAccounts(S.dashboardScope) : myAccounts())
+    .map(account => [account.id, account.name]);
+  const dashboardAccountTransactions = transactions => S.dashboardAccount
+    ? transactions.filter(transaction => (transaction.accountId || transaction.account) === S.dashboardAccount || transaction.toAccountId === S.dashboardAccount)
+    : transactions;
+  const dashboardChange = (current, previous) => {
+    if (!previous) return current ? { label: 'Mới phát sinh', state: 'new' } : { label: 'Không đổi', state: 'same' };
+    const change = (current - previous) / previous * 100;
+    return { label: `${Math.abs(change).toLocaleString('vi-VN', { maximumFractionDigits: 1 })}% ${change > 0 ? 'tăng' : change < 0 ? 'giảm' : 'không đổi'}`, state: change > 0 ? 'up' : change < 0 ? 'down' : 'same' };
+  };
   const dashShell = () => isAdmin ? `<div class="card"><div class="card-head"><h2 class="card-title">KỲ XEM</h2><div class="head-act">
       <button type="button" class="sm" data-act="dm" data-id="-1">${ic('s-left', 1)}Tháng trước</button><button type="button" class="sm" data-act="dm" data-id="1">Tháng sau${ic('s-right', 1)}</button>
       <button type="button" class="sm" data-act="dm" data-id="now">THÁNG NÀY</button><button type="button" class="sm" data-act="dm" data-id="all">TẤT CẢ</button></div></div>
@@ -398,12 +951,13 @@
         <button type="button" class="sm dashboard-month-arrow" data-act="dm" data-id="1" aria-label="Tháng sau">${ic('s-right', 1)}</button>
         <button type="button" class="sm dashboard-all-period" data-act="dm" data-id="all">Tất cả</button>
         <label class="dashboard-scope-select"><span>Phạm vi</span><select id="dashboardScope" data-live aria-label="Chọn phạm vi dashboard">${familyScopeOptions().map(([value, label]) => `<option value="${esc(value)}"${(S.dashboardScope || 'personal') === value ? ' selected' : ''}>${esc(label)}</option>`).join('')}</select></label>
+        <label class="dashboard-scope-select"><span>Tài khoản</span><select id="dashboardAccount" data-live aria-label="Lọc theo ví hoặc tài khoản"><option value="">Tất cả tài khoản</option>${dashboardAccountOptions().map(([value, label]) => `<option value="${esc(value)}"${S.dashboardAccount === value ? ' selected' : ''}>${esc(label)}</option>`).join('')}</select></label>
         <span class="dashboard-source">Dữ liệu trên thiết bị</span><button type="button" class="sm" data-act="refreshDash">${ic('s-refresh', 1)}Làm mới</button></div>
     </div><div id="dyn"></div>`;
   const h3 = 'style="margin:14px 0 8px;font-size:14px;color:var(--muted)"';
   const dashboardScopedTransactions = scope => db.tx.filter(t => scope === 'personal'
     ? t.owner === session.email && (!t.scope || t.scope === 'personal')
-    : t.scope === 'family' && t.familyId === scope);
+    : !!familyMemberOf(scope) && t.scope === 'family' && t.familyId === scope);
   const dashboardChartMonths = transactions => {
     const latestActivity = transactions.reduce((latest, tx) => tx.date && tx.date.slice(0, 7) > latest ? tx.date.slice(0, 7) : latest, '');
     const end = monthRe.test(S.dm || '') ? S.dm : (latestActivity || monthNow());
@@ -455,25 +1009,33 @@
   };
   const dashboardBudgets = (transactions, familyId) => {
     const month = monthRe.test(S.dm || '') ? S.dm : monthNow();
-    const entries = familyId ? [] : myBudgets().filter(b => b.month === month)
-      .sort((a, b) => budgetSpent(b) / Math.max(Number(b.amount), 1) - budgetSpent(a) / Math.max(Number(a.amount), 1));
-    const totalSpent = sum(transactions.filter(tx => tx.date.startsWith(month)), 'out');
+    const entries = (familyId ? familyBudgets(familyId, month) : myBudgets().filter(b => b.month === month))
+      .sort((a, b) => {
+        const spentA = familyId ? familyBudgetSpent(a) : budgetSpent(a);
+        const spentB = familyId ? familyBudgetSpent(b) : budgetSpent(b);
+        return spentB / Math.max(Number(b.amount), 1) - spentA / Math.max(Number(a.amount), 1);
+      });
+    const totalSpent = familyId
+      ? sum(transactions.filter(tx => tx.date.startsWith(month)), 'out')
+      : transactions.filter(tx => tx.type === 'out' && tx.date.startsWith(month) && entries.some(budget => budget.catId === tx.catId))
+        .reduce((total, tx) => total + Number(tx.amount || 0), 0);
     const family = familyId ? familyOf(familyId) : null;
     const totalBudget = familyId ? Number(family?.monthlyBudget || 0) : entries.reduce((total, budget) => total + Number(budget.amount || 0), 0);
-    const ratio = totalBudget > 0 ? totalSpent / totalBudget : 0, pct = totalBudget > 0 ? progress(totalSpent, totalBudget) : 0;
-    const state = ratio >= 1 ? 'over' : ratio >= .8 ? 'warn' : 'ok';
+    const state = budgetStatus(totalSpent, totalBudget), ratio = totalBudget > 0 ? totalSpent / totalBudget : 0;
+    const stateClass = state === 'exhausted' ? 'warn' : state;
+    const pct = totalBudget > 0 ? progress(totalSpent, totalBudget) : 0;
     const budgetSummary = totalBudget > 0 ? `<div class="dashboard-budget-summary">
         <div><span>Ngân sách tháng</span><strong>${money(totalBudget)}</strong></div><div><span>Đã chi</span><strong>${money(totalSpent)}</strong></div><div><span>Còn lại</span><strong class="${totalBudget - totalSpent < 0 ? 'exp' : 'inc'}">${money(totalBudget - totalSpent)}</strong></div>
-      </div><div class="dashboard-budget-track dashboard-budget-total-track"><i class="${state}" style="--bar-width:${pct}%"></i></div>
-      <div class="dashboard-budget-caption"><span>Đã sử dụng ${pct}%</span><span>${ratio >= 1 ? 'Đã vượt ngân sách' : ratio >= .8 ? 'Sắp chạm ngưỡng 80%' : 'Trong ngân sách'}</span></div>
-      ${ratio >= .8 ? `<p class="dashboard-budget-alert ${state}" role="status">${ratio >= 1 ? `Chi tiêu đã vượt ngân sách ${money(totalSpent - totalBudget)}.` : 'Lưu ý: chi tiêu đã đạt từ 80% ngân sách tháng.'}</p>` : ''}`
-      : `<div class="dashboard-empty">${familyId ? 'Gia đình chưa đặt ngân sách tháng.' : 'Chưa có ngân sách cho tháng này.'}<button type="button" class="sm" data-p="${familyId ? 'family' : 'budget'}">${familyId ? 'Quản lý gia đình' : 'Tạo ngân sách'}</button></div>`;
-    if (familyId) return budgetSummary;
+      </div><div class="dashboard-budget-track dashboard-budget-total-track"><i class="${stateClass}" style="--bar-width:${pct}%"></i></div>
+      <div class="dashboard-budget-caption"><span>Đã sử dụng ${pct}%</span><span>${state === 'over' ? 'Vượt ngân sách' : state === 'exhausted' ? 'Đã dùng hết ngân sách' : state === 'warn' ? 'Đã dùng ít nhất 80%' : 'Trong ngân sách'}</span></div>
+      ${state !== 'ok' ? `<p class="dashboard-budget-alert ${stateClass}" role="status">${state === 'over' ? `Chi tiêu đã vượt ngân sách ${money(totalSpent - totalBudget)}.` : state === 'exhausted' ? 'Chi tiêu đã sử dụng đúng 100% ngân sách tháng.' : 'Lưu ý: chi tiêu đã đạt ít nhất 80% ngân sách tháng.'}</p>` : ''}`
+      : `<div class="dashboard-empty">${familyId ? 'Gia đình chưa đặt ngân sách chung tháng này.' : 'Chưa có ngân sách cho tháng này.'}<button type="button" class="sm" data-p="${familyId ? 'family' : 'budget'}">${familyId ? 'Quản lý gia đình' : 'Tạo ngân sách'}</button></div>`;
     const budgetItems = entries.length ? `<div class="dashboard-budget-list">${entries.map((b, index) => {
-      const spent = transactions.filter(t => t.type === 'out' && t.catId === b.catId && t.date.startsWith(b.month)).reduce((s, t) => s + Number(t.amount || 0), 0);
-      const itemRatio = spent / Math.max(Number(b.amount), 1), itemPct = progress(spent, b.amount);
-      const itemState = itemRatio >= 1 ? 'over' : itemRatio >= .8 ? 'warn' : 'ok';
-      return `<div class="dashboard-budget-item" style="--chart-delay:${index * 65}ms"><div class="dashboard-budget-head"><b>${esc(catOf(b.catId)?.name || 'Danh mục đã xóa')}</b><span class="dashboard-budget-state ${itemState}">${itemRatio >= 1 ? 'Vượt ngân sách' : itemRatio >= .8 ? 'Gần chạm mức' : `${itemPct}%`}</span></div>
+      const spent = familyId ? familyBudgetSpent(b) : budgetSpent(b);
+      const itemStatus = budgetStatus(spent, b.amount), itemState = itemStatus === 'exhausted' ? 'warn' : itemStatus;
+      const itemPct = progress(spent, b.amount);
+      const itemLabel = itemStatus === 'over' ? 'Vượt ngân sách' : itemStatus === 'exhausted' ? 'Đã dùng hết 100%' : itemStatus === 'warn' ? 'Đã dùng ít nhất 80%' : `${itemPct}%`;
+      return `<div class="dashboard-budget-item" style="--chart-delay:${index * 65}ms"><div class="dashboard-budget-head"><b>${esc(catOf(b.catId)?.name || 'Danh mục đã xóa')}</b><span class="dashboard-budget-state ${itemState}">${itemLabel}</span></div>
         <div class="dashboard-budget-track"><i class="${itemState}" style="--bar-width:${itemPct}%"></i></div><div class="dashboard-budget-caption"><span>${money(spent)} đã dùng</span><span>${money(b.amount)}</span></div></div>`;
     }).join('')}</div>` : '';
     return budgetSummary + budgetItems;
@@ -481,31 +1043,65 @@
   const dashboardRecent = transactions => {
     const items = recent(transactions, 5);
     if (!items.length) return chartEmpty('Chưa có giao dịch trong kỳ này');
-    return `<div class="dashboard-recent-list">${items.map(t => `<button type="button" class="dashboard-recent-item" data-act="viewTx" data-id="${esc(t.id)}">
-      <span class="dashboard-recent-icon ${t.type}">${ic(t.type === 'in' ? 'i-coins' : 'i-receipt')}</span><span class="dashboard-recent-description"><b>${esc(t.note || cname(t))}</b><small>${esc(cname(t))} · ${fdate(t.date)} · ${esc(accountLabel(t.accountId || t.account))}</small></span>
-      <strong class="${t.type === 'in' ? 'inc' : 'exp'}">${t.type === 'in' ? '+' : '-'}${money(t.amount)}</strong></button>`).join('')}</div>`;
+    return `<div class="dashboard-recent-list">${items.map(t => `<article class="dashboard-recent-item">
+      <span class="dashboard-recent-icon ${t.type}">${ic(t.type === 'in' ? 'i-coins' : t.type === 'transfer' ? 'i-wallet' : 'i-receipt')}</span><span class="dashboard-recent-description"><b>${esc(t.note || (t.type === 'transfer' ? `Chuyển đến ${accountLabel(t.toAccountId)}` : cname(t)))}</b><small>${esc(t.type === 'transfer' ? `Chuyển ví · ${accountLabel(t.accountId)} → ${accountLabel(t.toAccountId)}` : cname(t))} · ${fdate(t.date)} · ${esc(accountLabel(t.accountId || t.account))}</small></span>
+      <strong class="${t.type === 'in' ? 'inc' : t.type === 'out' ? 'exp' : 'transfer'}">${t.type === 'in' ? '+' : t.type === 'out' ? '-' : '↔ '}${money(t.amount)}</strong>
+      <div class="dashboard-recent-actions"><button type="button" class="sm" data-act="viewTx" data-id="${esc(t.id)}" aria-label="Xem giao dịch">${ic('i-eye')}</button>
+        ${canEditFamilyTransaction(t) ? `<button type="button" class="sm" data-act="editTx" data-id="${esc(t.id)}" aria-label="Sửa giao dịch">${ic('i-pen-to-square')}</button>` : ''}
+        ${canDeleteFamilyTransaction(t) ? `<button type="button" class="sm red" data-act="delTx" data-id="${esc(t.id)}" aria-label="Xóa giao dịch">${ic('s-trash', 1)}</button>` : ''}</div></article>`).join('')}</div>`;
   };
   const userDash = () => {
     const scope = S.dashboardScope || 'personal';
     const familyId = scope === 'personal' ? '' : scope;
     const family = familyId ? familyOf(familyId) : null;
+    const scopeAccounts = familyId ? familyAccounts(familyId) : myAccounts();
+    if (S.dashboardAccount && !scopeAccounts.some(account => account.id === S.dashboardAccount)) delete S.dashboardAccount;
     const label = family ? family.name : 'cá nhân';
     const allScopedTransactions = dashboardScopedTransactions(scope);
-    const l = allScopedTransactions.filter(inMonth);
+    const accountTransactions = dashboardAccountTransactions(allScopedTransactions);
+    const l = accountTransactions.filter(inMonth);
     const income = sum(l, 'in'), expense = sum(l, 'out');
-    const monthlyValues = dashboardMonthlyValues(allScopedTransactions);
+    const comparisonMonth = monthRe.test(S.dm || '') ? S.dm : monthNow();
+    const previousMonth = shiftMonth(comparisonMonth, -1);
+    const previousTransactions = accountTransactions.filter(transaction => transaction.date.startsWith(previousMonth));
+    const incomeChange = dashboardChange(income, sum(previousTransactions, 'in'));
+    const expenseChange = dashboardChange(expense, sum(previousTransactions, 'out'));
+    const currentMonth = monthNow();
+    const currentMonthTransactions = accountTransactions.filter(transaction => transaction.date.startsWith(currentMonth));
+    const elapsedDays = new Date().getDate();
+    const daysInMonth = new Date(Number(currentMonth.slice(0, 4)), Number(currentMonth.slice(5, 7)), 0).getDate();
+    const forecast = sum(currentMonthTransactions, 'out') / Math.max(elapsedDays, 1) * daysInMonth;
+    const accounts = scopeAccounts.filter(account => !S.dashboardAccount || account.id === S.dashboardAccount);
+    const assets = accounts.reduce((total, account) => total + accountBalance(account), 0);
+    const currentBudgetEntries = familyId ? [] : myBudgets().filter(budget => budget.month === currentMonth);
+    const budgetLimit = familyId ? Number(family?.monthlyBudget || 0) : currentBudgetEntries.reduce((total, budget) => total + Number(budget.amount || 0), 0);
+    const budgetSpentTotal = familyId
+      ? sum(allScopedTransactions.filter(transaction => transaction.date.startsWith(currentMonth)), 'out')
+      : currentBudgetEntries.reduce((total, budget) => total + Math.min(Number(budget.amount || 0), budgetSpent(budget)), 0);
+    const budgetRemaining = budgetLimit > 0 ? Math.max(0, budgetLimit - budgetSpentTotal) : assets;
+    const spendable = Math.min(Math.max(assets, 0), budgetRemaining);
+    const comparisonLabel = monthRe.test(S.dm || '') ? `So với ${previousMonth.slice(5, 7)}/${previousMonth.slice(0, 4)}` : 'Toàn bộ giao dịch';
     return `<div class="dashboard-summary">
-        <div class="dashboard-total income">${ic('i-coins')}<span>TỔNG THU NHẬP</span><strong>+${money(income)}</strong></div>
-        <div class="dashboard-total expense">${ic('i-receipt')}<span>TỔNG CHI TIÊU</span><strong>-${money(expense)}</strong></div>
+        <div class="dashboard-total income">${ic('i-coins')}<span>TỔNG THU NHẬP</span><strong>+${money(income)}</strong><small class="dashboard-change ${incomeChange.state}">${comparisonLabel === 'Toàn bộ giao dịch' ? comparisonLabel : `${incomeChange.label} ${comparisonLabel}`}</small></div>
+        <div class="dashboard-total expense">${ic('i-receipt')}<span>TỔNG CHI TIÊU</span><strong>-${money(expense)}</strong><small class="dashboard-change ${expenseChange.state}">${comparisonLabel === 'Toàn bộ giao dịch' ? comparisonLabel : `${expenseChange.label} ${comparisonLabel}`}</small></div>
         <div class="dashboard-total balance-stat"><span>CHÊNH LỆCH THU CHI</span><strong class="${income - expense < 0 ? 'exp' : 'inc'}">${income - expense < 0 ? '-' : '+'}${money(Math.abs(income - expense))}</strong><small>Thu nhập trừ chi tiêu trong kỳ</small></div>
         <div class="dashboard-total transaction-stat">${ic('i-layer-group')}<span>TỔNG GIAO DỊCH</span><strong>${l.length.toLocaleString('vi-VN')}</strong><small>${l.filter(tx => tx.type === 'in').length} thu · ${l.filter(tx => tx.type === 'out').length} chi</small></div>
+        <div class="dashboard-total asset-stat">${ic('i-wallet')}<span>SỐ DƯ VÍ / TÀI SẢN</span><strong>${money(assets)}</strong><small>${accounts.length} tài khoản · số dư hiện tại</small></div>
+        <div class="dashboard-total spendable-stat">${ic('i-piggy-bank')}<span>CÒN CÓ THỂ CHI</span><strong>${money(spendable)}</strong><small>${budgetLimit > 0 ? 'Theo hạn mức ngân sách còn lại' : 'Theo số dư tài khoản hiện có'}</small></div>
+        <div class="dashboard-total forecast-stat">${ic('i-chart-pie')}<span>DỰ BÁO CHI CUỐI THÁNG</span><strong>${money(forecast)}</strong><small>Ước tính theo tốc độ chi ${sum(currentMonthTransactions, 'out') ? `(${elapsedDays}/${daysInMonth} ngày)` : 'hiện tại'}</small></div>
       </div>
       <div class="dashboard-charts">
-        <section class="card dashboard-section dashboard-chart-panel"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">DÒNG TIỀN</span><h2>Thu nhập và chi tiêu theo tháng</h2></div></div>${dashboardMonthlyChart(allScopedTransactions)}</section>
+        <section class="card dashboard-section dashboard-chart-panel"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">DÒNG TIỀN</span><h2>Thu nhập và chi tiêu theo tháng</h2></div></div>${dashboardMonthlyChart(accountTransactions)}</section>
         <section class="card dashboard-section dashboard-chart-panel"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">PHÂN BỔ CHI TIÊU</span><h2>Chi tiêu theo danh mục</h2></div><span class="dashboard-section-total">${money(expense)}</span></div>${pie(by(l, 'out'))}</section>
-        <section class="card dashboard-section dashboard-chart-panel dashboard-trend-panel"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">BIẾN ĐỘNG</span><h2>Xu hướng tài chính</h2></div></div>${dashboardMonthlyChart(allScopedTransactions, true)}</section>
+        <section class="card dashboard-section dashboard-chart-panel"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">TOP 5 DANH MỤC</span><h2>Danh mục chi tiêu lớn nhất</h2></div></div>${dashboardRankedBars(by(l, 'out'), 'expense')}</section>
+        <section class="card dashboard-section dashboard-chart-panel dashboard-trend-panel"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">BIẾN ĐỘNG</span><h2>Xu hướng tài chính</h2></div></div>${dashboardMonthlyChart(accountTransactions, true)}</section>
       </div>
       <div class="dashboard-content-grid">
+        <section class="card dashboard-section money-accounts-card"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">SỐ DƯ HIỆN TẠI</span><h2>${familyId ? 'Ví quỹ chung' : 'Ví và tài khoản của bạn'}</h2></div><button type="button" class="sm" data-p="moneyAccounts">Quản lý ví</button></div>
+          <div class="money-account-list">${accounts.map(account => `<article class="money-account-row"><span class="money-account-icon ${esc(account.type)}">${ic(account.type === 'wallet' ? 'i-mobile-screen-button' : 'i-wallet')}</span>
+            <div class="money-account-copy"><b>${esc(account.name)}</b><small>${esc(accountTypeLabel(account.type))}</small></div><strong>${money(accountBalance(account))}</strong></article>`).join('')}</div>
+          <div class="money-account-total"><span>${S.dashboardAccount ? 'SỐ DƯ ĐÃ CHỌN' : familyId ? 'TỔNG SỐ DƯ VÍ CHUNG' : 'TỔNG TÀI SẢN'}</span><strong>${money(assets)}</strong></div>
+        </section>
         <section class="card dashboard-section"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">NGÂN SÁCH · ${dashboardMonthLabel(monthRe.test(S.dm || '') ? S.dm : monthNow())}</span><h2>${family ? `Ngân sách · ${esc(family.name)}` : 'Ngân sách cá nhân'}</h2></div><button type="button" class="sm" data-p="${family ? 'family' : 'budget'}">Quản lý</button></div>${dashboardBudgets(allScopedTransactions, familyId)}</section>
         <section class="card dashboard-section dashboard-recent-section"><div class="dashboard-section-heading"><div><span class="dashboard-eyebrow">HOẠT ĐỘNG MỚI NHẤT</span><h2>Giao dịch gần đây · ${esc(label)}</h2></div></div>${dashboardRecent(l)}<button type="button" class="sm dashboard-view-all" data-p="tx">XEM TẤT CẢ GIAO DỊCH</button></section>
       </div>`; };
@@ -540,23 +1136,48 @@
     const month = e.month || monthNow();
     const entries = myBudgets().slice().sort((a, b) => b.month.localeCompare(a.month));
     return `<form class="card" data-f="budget" novalidate><h2 class="card-title">${e.id ? 'SỬA' : 'TẠO'} NGÂN SÁCH</h2>
-      <div class="grid2">${field('bcat', 'Danh mục Chi', 'i-layer-group', { tag: 'select', opts: catOpts(e.catId, 'Chọn danh mục Chi', 'out') })}${field('bmonth', 'Tháng', 's-cal', { type: 'month', val: month })}
+      <div class="grid2">${field('bcat', 'Danh mục Chi', 'i-layer-group', { tag: 'select', opts: catOpts(e.catId, 'Chọn danh mục Chi', 'out', [catOf(e.catId)]) })}${field('bmonth', 'Tháng', 's-cal', { type: 'month', val: month })}
       ${field('bamount', 'Số tiền ngân sách (₫)', 'i-coins', { type: 'number', val: e.amount, attr: 'min="1"' })}</div>
       <div class="actions">${e.id ? '<button type="button" class="btn-ghost-d" data-act="cancelBudget">HỦY</button>' : ''}<button class="btn-primary">${e.id ? 'LƯU THAY ĐỔI' : 'TẠO NGÂN SÁCH'}</button></div></form>
       <div class="card"><div class="card-head"><h2 class="card-title">NGÂN SÁCH CỦA TÔI</h2><span class="badge">${entries.length} danh mục</span></div>
       ${entries.length ? `<div class="progress-list">${entries.map(b => {
-        const spent = budgetSpent(b), ratio = spent / Math.max(b.amount, 1), pct = progress(spent, b.amount);
-        const state = ratio >= 1 ? 'over' : ratio >= .8 ? 'warn' : 'ok';
-        const label = ratio > 1 ? 'Đã vượt 100%' : ratio === 1 ? 'Đã dùng hết 100%' : ratio >= .8 ? 'Sắp đạt giới hạn 80%' : 'Trong ngân sách';
+        const spent = budgetSpent(b), status = budgetStatus(spent, b.amount), pct = progress(spent, b.amount);
+        const state = status === 'exhausted' ? 'warn' : status;
+        const label = status === 'over' ? 'Đã vượt 100%' : status === 'exhausted' ? 'Đã dùng hết 100%' : status === 'warn' ? 'Đã dùng ít nhất 80%' : 'Trong ngân sách';
         return `<article class="progress-item"><div class="card-head"><div><h3>${esc(catOf(b.catId)?.name || '(Danh mục đã xóa)')}</h3><small>${esc(b.month)} · <span class="badge ${state}">${label}</span></small></div><div class="cell-act"><button class="sm" data-act="editBudget" data-id="${esc(b.id)}">${ic('i-pen-to-square')}Sửa</button><button class="sm red" data-act="delBudget" data-id="${esc(b.id)}">${ic('s-trash', 1)}Xóa</button></div></div>
           ${progressBar(spent, b.amount, state)}<div class="progress-caption"><b>${money(spent)}</b><span>${pct}%</span><span>Ngân sách ${money(b.amount)}</span></div></article>`;
       }).join('')}</div>` : `<div class="chart-empty">Chưa có ngân sách. Tạo ngân sách đầu tiên để theo dõi chi tiêu.</div>`}</div>`;
   };
+  /* ===== Hồ sơ gia đình: quan hệ khác với quyền quản trị ===== */
+  const FAMILY_RELATIONS = [
+    ['', 'Chưa cập nhật', '🧩'], ['father', 'Bố', '👨'], ['mother', 'Mẹ', '👩'],
+    ['husband', 'Chồng', '💙'], ['wife', 'Vợ', '💖'], ['son', 'Con trai', '👦'],
+    ['daughter', 'Con gái', '👧'], ['older_brother', 'Anh trai', '👨'],
+    ['older_sister', 'Chị gái', '👩'], ['younger_brother', 'Em trai', '👦'],
+    ['younger_sister', 'Em gái', '👧'], ['grandfather', 'Ông', '👴'],
+    ['grandmother', 'Bà', '👵'], ['other', 'Người thân khác', '💞']
+  ];
+  const familyRelationship = member => FAMILY_RELATIONS.find(([key]) => key === (member?.relationship || '')) || FAMILY_RELATIONS[0];
+  const familyRole = role => role === 'OWNER' ? 'Chủ gia đình' : role === 'MANAGER' ? 'Quản lý tài chính' : 'Thành viên';
+  const familyTransactionFor = (familyId, email, period = 'all') => db.tx.filter(t =>
+    t.scope === 'family' && t.familyId === familyId && t.owner === email &&
+    (period === 'all' || (t.date || '').startsWith(period))
+  ).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  const familyProfileMonth = () => S.familyProfileMonth || monthNow();
+  const familySpendingByCategory = transactions => Object.entries(transactions.filter(t => t.type === 'out').reduce((items, transaction) => {
+    const label = cname(transaction);
+    items[label] = (items[label] || 0) + Number(transaction.amount || 0);
+    return items;
+  }, {})).sort((a, b) => b[1] - a[1]);
+
   const familyPendingRequests = familyId => db.familyMembers.filter(m => m.familyId === familyId && m.status === 'PENDING');
+  const familyInvitesFor = familyId => db.familyInvites.filter(invite => invite.familyId === familyId && invite.status === 'PENDING');
+  const familyInvitesToMe = () => db.familyInvites.filter(invite => invite.status === 'PENDING' && (invite.email || '').toLowerCase() === session.email.toLowerCase());
   const familyTabButtons = [
     ['overview', 'Tổng quan'],
     ['transactions', 'Giao dịch'],
     ['members', 'Thành viên'],
+    ['fund', 'Quỹ chung'],
     ['budget', 'Ngân sách'],
     ['report', 'Báo cáo'],
     ['settings', 'Cài đặt']
@@ -564,92 +1185,232 @@
   const familySummaryData = familyId => {
     const family = familyOf(familyId);
     const transactions = db.tx.filter(t => t.scope === 'family' && t.familyId === familyId).slice().sort((a, b) => b.date.localeCompare(a.date));
+    const monthTransactions = transactions.filter(t => t.date.startsWith(monthNow()));
     const members = familyMembersOf(familyId).map(member => ({ ...member, user: findUser(member.userEmail) }));
-    const totalSpent = transactions.filter(t => t.type === 'out').reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+    const totalSpent = monthTransactions.filter(t => t.type === 'out').reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
     const budgetAmount = Number(family?.monthlyBudget || 0);
     const remaining = budgetAmount - totalSpent;
-    const byCategory = transactions.filter(t => t.type === 'out').reduce((map, tx) => {
+    const byCategory = monthTransactions.filter(t => t.type === 'out').reduce((map, tx) => {
       const label = cname(tx);
       map[label] = (map[label] || 0) + Number(tx.amount || 0);
       return map;
     }, {});
     const byMember = members.reduce((map, member) => {
-      const spent = transactions.filter(t => t.type === 'out' && t.owner === member.userEmail).reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+      const spent = monthTransactions.filter(t => t.type === 'out' && t.owner === member.userEmail).reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
       map[member.userEmail] = spent;
       return map;
     }, {});
-    return { family, members, transactions, totalSpent, budgetAmount, remaining, byCategory, byMember };
+    return { family, members, transactions, monthTransactions, totalSpent, budgetAmount, remaining, byCategory, byMember };
+  };
+  const familyTrendHtml = transactions => {
+    const months = Array.from({ length: 6 }, (_, index) => shiftMonth(monthNow(), index - 5));
+    const values = months.map(month => {
+      const items = transactions.filter(tx => tx.date.startsWith(month));
+      return {
+        month,
+        income: items.filter(tx => tx.type === 'in').reduce((total, tx) => total + Number(tx.amount || 0), 0),
+        expense: items.filter(tx => tx.type === 'out').reduce((total, tx) => total + Number(tx.amount || 0), 0)
+      };
+    });
+    const max = Math.max(1, ...values.flatMap(item => [item.income, item.expense]));
+    return `<div class="family-trend">${values.map(item => `<div class="family-trend-row"><span>${esc(item.month.slice(5))}/${esc(item.month.slice(0, 4))}</span><div class="family-trend-bars" aria-label="Thu ${money(item.income)}, chi ${money(item.expense)}"><i class="in" style="width:${item.income / max * 100}%"></i><i class="out" style="width:${item.expense / max * 100}%"></i></div><small><b class="inc">${money(item.income)}</b><b class="exp">${money(item.expense)}</b></small></div>`).join('')}</div><div class="family-trend-legend"><span><i class="in"></i>Thu</span><span><i class="out"></i>Chi</span></div>`;
   };
   const familyOverviewTab = familyId => {
-    const { family, members, transactions, totalSpent, budgetAmount, remaining, byCategory } = familySummaryData(familyId);
-    const monthLabel = today().slice(0, 7);
+    const { family, members, transactions, monthTransactions, totalSpent, budgetAmount, remaining, byCategory, byMember } = familySummaryData(familyId);
     const memberCount = members.length;
-    const overviewCards = [`<div class="family-kpi-card"><small>Tổng chi tháng này</small><strong>${money(totalSpent)}</strong></div>`, `<div class="family-kpi-card"><small>Ngân sách</small><strong>${money(budgetAmount)}</strong></div>`, `<div class="family-kpi-card"><small>Còn lại</small><strong>${money(remaining)}</strong></div>`, `<div class="family-kpi-card"><small>Thành viên</small><strong>${memberCount} người</strong></div>`].join('');
+    const fundEntries = db.familyFundEntries.filter(entry => entry.familyId === familyId);
+    const fundBalance = fundEntries.reduce((balance, entry) => balance + (entry.type === 'contribution' ? 1 : -1) * Number(entry.amount || 0), 0);
+    const overviewCards = [`<div class="family-kpi-card"><small>Chi tháng ${esc(monthNow())}</small><strong>${money(totalSpent)}</strong></div>`, `<div class="family-kpi-card"><small>Ngân sách tháng</small><strong>${money(budgetAmount)}</strong></div>`, `<div class="family-kpi-card"><small>Còn lại tháng này</small><strong>${money(remaining)}</strong></div>`, `<div class="family-kpi-card"><small>Thành viên</small><strong>${memberCount} người</strong></div>`].join('');
+    const income = transactions.filter(t => t.type === 'in').reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+    const expense = transactions.filter(t => t.type === 'out').reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
     const recent = transactions.slice(0, 5);
     const categoryChart = Object.keys(byCategory).length ? pie(byCategory) : `<div class="chart-empty">Chưa có dữ liệu</div>`;
-    const memberChart = members.length ? `<div class="family-member-breakdown">${members.map(member => { const spent = (familySummaryData(familyId).byMember[member.userEmail] || 0); const count = transactions.filter(t => t.owner === member.userEmail).length; return `<div class="family-member-breakdown-row"><div><strong>${esc(member.user?.name || member.userEmail)}</strong><small>${member.role === 'OWNER' ? 'OWNER' : 'MEMBER'} · ${count} giao dịch</small></div><span>${money(spent)}</span></div>`; }).join('')}</div>` : '<div class="chart-empty">Chưa có thành viên</div>';
+    const memberChart = members.length ? `<div class="family-member-breakdown">${members.map(member => { const spent = byMember[member.userEmail] || 0; const count = monthTransactions.filter(t => t.owner === member.userEmail).length; const roleLabel = member.role === 'OWNER' ? 'Chủ gia đình' : member.role === 'MANAGER' ? 'Người quản lý' : 'Thành viên'; return `<div class="family-member-breakdown-row"><div><strong>${esc(member.user?.name || member.userEmail)}</strong><small>${roleLabel} · ${count} giao dịch tháng này</small></div><span>${money(spent)}</span></div>`; }).join('')}</div>` : '<div class="chart-empty">Chưa có thành viên</div>';
     return `<div class="family-section-grid">
+      <section class="family-summary-card family-fund-card"><div class="card-head"><div><span class="dashboard-eyebrow">GIAO DỊCH DÙNG CHUNG</span><h3 class="card-title">TỔNG QUAN TÀI CHÍNH</h3></div><button type="button" class="sm" data-act="familyTab" data-id="fund">Mở sổ quỹ</button></div>
+        <div class="family-fund-grid"><div><span>Tổng thu chung</span><strong class="inc">${money(income)}</strong></div><div><span>Tổng chi chung</span><strong class="exp">${money(expense)}</strong></div><div><span>Số dư quỹ chung</span><strong>${money(fundBalance)}</strong></div></div></section>
       <div class="family-kpi-grid">${overviewCards}</div>
       <div class="family-summary-card">
-        <div class="card-head"><h3 class="card-title">CHI TIÊU THEO DANH MỤC</h3></div>
+        <div class="card-head"><h3 class="card-title">CHI TIÊU THEO DANH MỤC · THÁNG NÀY</h3></div>
         ${categoryChart}
       </div>
       <div class="family-summary-card">
-        <div class="card-head"><h3 class="card-title">CHI TIÊU THEO THÀNH VIÊN</h3></div>
+        <div class="card-head"><h3 class="card-title">CHI TIÊU THEO THÀNH VIÊN · THÁNG NÀY</h3></div>
         ${memberChart}
+      </div>
+      <div class="family-summary-card family-trend-card">
+        <div class="card-head"><h3 class="card-title">XU HƯỚNG THU CHI · 6 THÁNG</h3></div>
+        ${familyTrendHtml(transactions)}
       </div>
       <div class="family-summary-card">
         <div class="card-head"><h3 class="card-title">GIAO DỊCH GẦN ĐÂY</h3><button type="button" class="btn-ghost-d" data-act="familyTab" data-id="transactions">Xem tất cả</button></div>
-        ${recent.length ? `<div class="family-transaction-list">${recent.map(tx => `<div class="family-transaction-item"><div><span>${esc(tx.note || cname(tx))}</span><small>${esc(uname(tx.owner))} · ${fdate(tx.date)}</small></div><strong class="${tx.type === 'in' ? 'inc' : 'exp'}">${tx.type === 'in' ? '+' : '-'}${money(tx.amount)}</strong></div>`).join('')}</div>` : '<div class="chart-empty">Chưa có giao dịch</div>'}
+        ${recent.length ? `<div class="family-transaction-list">${recent.map(tx => { const transfer = tx.type === 'transfer'; return `<div class="family-transaction-item"><div><span>${esc(transfer ? `Chuyển ${accountLabel(tx.accountId)} → ${accountLabel(tx.toAccountId)}` : tx.note || cname(tx))} <small class="family-shared-label">Dùng chung</small></span><small>${esc(uname(tx.owner))} · ${fdate(tx.date)}</small></div><strong class="${transfer ? 'transfer' : tx.type === 'in' ? 'inc' : 'exp'}">${transfer ? '' : tx.type === 'in' ? '+' : '−'}${money(tx.amount)}</strong></div>`; }).join('')}</div>` : '<div class="chart-empty">Chưa có giao dịch</div>'}
       </div>
     </div>`;
   };
-  const familyTransactionsTab = familyId => {
-    const family = familyOf(familyId);
-    const transactions = db.tx.filter(t => t.scope === 'family' && t.familyId === familyId).slice().sort((a, b) => b.date.localeCompare(a.date));
-    const rows = transactions.map((tx, index) => `<tr><td>${index + 1}</td><td>${fdate(tx.date)}</td><td>${esc(tx.note || cname(tx))}</td><td>${esc(cname(tx))}</td><td>${esc(uname(tx.owner))}</td><td>${esc(accountLabel(tx.accountId || tx.account))}</td><td class="${tx.type === 'in' ? 'inc' : 'exp'}">${money(tx.amount)}</td></tr>`).join('');
-    return `<div class="family-toolbar"><div class="toolbar two"><input id="familyTxSearch" class="family-filter" type="text" placeholder="Tìm kiếm" data-live><select id="familyTxMember" class="family-filter" data-live><option value="">Tất cả thành viên</option>${familyMembersOf(familyId).map(member => `<option value="${esc(member.userEmail)}">${esc(findUser(member.userEmail)?.name || member.userEmail)}</option>`).join('')}</select></div><button type="button" class="btn-primary" data-act="addFamilyTransaction">${ic('s-plus', 1)}Thêm giao dịch</button></div>
-      <div class="family-table-wrap"><table class="family-table"><thead><tr><th>#</th><th>Ngày</th><th>Nội dung</th><th>Danh mục</th><th>Người thực hiện</th><th>Ví/Tài khoản</th><th>Số tiền</th></tr></thead><tbody>${rows || '<tr><td colspan="7" class="family-empty-cell">Chưa có giao dịch</td></tr>'}</tbody></table></div>`;
+  const familyTransactionsFiltered = familyId => {
+    const query = (S.familyTxSearch || '').trim().toLocaleLowerCase('vi');
+    const memberFilter = S.familyTxMember || '';
+    const monthFilter = S.familyTxMonth || '';
+    const typeFilter = S.familyTxType || '';
+    return db.tx.filter(t => t.scope === 'family' && t.familyId === familyId)
+      .filter(t => (!memberFilter || t.owner === memberFilter) && (!monthFilter || t.date.startsWith(monthFilter)) && (!typeFilter || t.type === typeFilter) &&
+        (!query || `${t.note || ''} ${cname(t)} ${t.amount} ${Number(t.amount).toLocaleString('vi-VN')}`.toLocaleLowerCase('vi').includes(query)))
+      .slice().sort((a, b) => b.date.localeCompare(a.date));
   };
+  const familyTxRowsHtml = transactions => transactions.map((tx, index) => { const transfer = tx.type === 'transfer'; const amountClass = transfer ? 'transfer' : tx.type === 'in' ? 'inc' : 'exp'; const label = transfer ? `Chuyển ví · ${accountLabel(tx.accountId)} → ${accountLabel(tx.toAccountId)}` : tx.note || cname(tx); return `<tr><td>${index + 1}</td><td>${fdate(tx.date)}</td><td>${esc(label)}<small class="family-shared-label">Dùng chung</small></td><td>${transfer ? 'Chuyển nội bộ' : esc(cname(tx))}</td><td>${esc(uname(tx.owner))}</td><td>${esc(accountLabel(tx.accountId || tx.account))}</td><td class="${amountClass}">${transfer ? '' : tx.type === 'in' ? '+' : '−'}${money(tx.amount)}</td><td><div class="family-inline-actions"><button type="button" class="sm" data-act="viewTx" data-id="${esc(tx.id)}">Xem</button>${canEditFamilyTransaction(tx) ? `<button type="button" class="sm" data-act="editTx" data-id="${esc(tx.id)}">Sửa</button>` : ''}${canDeleteFamilyTransaction(tx) ? `<button type="button" class="sm red" data-act="delTx" data-id="${esc(tx.id)}">Xóa</button>` : ''}</div></td></tr>`; }).join('');
+  const familyTxSummaryHtml = transactions => {
+    const income = transactions.filter(tx => tx.type === 'in').reduce((total, tx) => total + Number(tx.amount || 0), 0);
+    const expense = transactions.filter(tx => tx.type === 'out').reduce((total, tx) => total + Number(tx.amount || 0), 0);
+    const balance = income - expense;
+    return `<div class="family-filter-summary"><div><span>Giao dịch</span><strong>${transactions.length}</strong></div><div><span>Tổng thu</span><strong class="inc">${money(income)}</strong></div><div><span>Tổng chi</span><strong class="exp">${money(expense)}</strong></div><div><span>Chênh lệch</span><strong class="${balance < 0 ? 'exp' : 'inc'}">${money(balance)}</strong></div></div>`;
+  };
+  const familyTransactionsTab = familyId => {
+    const memberFilter = S.familyTxMember || '';
+    const monthFilter = S.familyTxMonth || '';
+    const transactions = familyTransactionsFiltered(familyId);
+    const rows = familyTxRowsHtml(transactions);
+    return `<div class="family-toolbar"><div class="family-filters"><input id="familyTxSearch" class="family-filter" type="search" placeholder="Tìm từ khóa, danh mục, số tiền" aria-label="Tìm giao dịch" data-live value="${esc(S.familyTxSearch || '')}"><select id="familyTxMember" class="family-filter" aria-label="Lọc theo thành viên" data-live>${opt(familyMembersOf(familyId).map(member => [member.userEmail, findUser(member.userEmail)?.name || member.userEmail]), memberFilter, 'Tất cả thành viên')}</select><input id="familyTxMonth" class="family-filter" type="month" aria-label="Lọc theo tháng" data-live value="${esc(monthFilter)}"><select id="familyTxType" class="family-filter" aria-label="Lọc theo loại giao dịch" data-live>${opt(TRANSACTION_TYPES, S.familyTxType || '', 'Tất cả loại')}</select><button type="button" class="sm" data-act="resetFamilyTxFilter">Xóa lọc</button></div><div class="family-toolbar-actions"><button type="button" class="sm" data-act="exportFamilyTx">${ic('s-download', 1)}Xuất CSV</button><button type="button" class="btn-primary" data-act="addFamilyTransaction">${ic('s-plus', 1)}Thêm giao dịch</button></div></div>
+      ${familyTxSummaryHtml(transactions)}
+      <p class="family-filter-count">${transactions.length} giao dịch sau lọc</p>
+      <div class="family-table-wrap"><table class="family-table"><thead><tr><th>#</th><th>Ngày</th><th>Nội dung</th><th>Danh mục</th><th>Người thực hiện</th><th>Ví/Tài khoản</th><th>Số tiền</th><th>Thao tác</th></tr></thead><tbody id="familyTxRows">${rows || '<tr><td colspan="8" class="family-empty-cell">Không có giao dịch phù hợp</td></tr>'}</tbody></table></div>`;
+  };
+  const familyMemberProfile = (familyId, member) => {
+    const family = familyOf(familyId);
+    if (!family || !familyMemberOf(familyId)) return '<p>Không có quyền truy cập hồ sơ.</p>';
+    const user = findUser(member.userEmail);
+    const name = user?.name || member.userEmail;
+    const [relKey, relation, emoji] = familyRelationship(member);
+    const period = familyProfileMonth();
+    const filtered = familyTransactionFor(familyId, member.userEmail, period);
+    const spending = filtered.filter(t => t.type === 'out');
+    const income = filtered.filter(t => t.type === 'in');
+    const spent = spending.reduce((total, t) => total + Number(t.amount || 0), 0);
+    const earned = income.reduce((total, t) => total + Number(t.amount || 0), 0);
+    const categories = familySpendingByCategory(filtered);
+    const canUpdateInfo = canManageFamily(familyId) || session.email === member.userEmail;
+    const isOwner = member.role === 'OWNER' || family.ownerEmail === member.userEmail;
+    const canUpdateRole = canManageFamilyRoles(familyId) && !isOwner;
+    const canRemove = canManageFamily(familyId) && member.userEmail !== session.email && !isOwner &&
+      (family.ownerEmail === session.email || member.role === 'MEMBER');
+    const roleToken = isOwner ? 'owner' : member.role === 'MANAGER' ? 'manager' : 'member';
+    const active = S.familyProfileTab || 'overview';
+    const graph = categories.length ? `<div class="et-profile-chart">${categories.slice(0, 6).map(([category, amount], i) => `<div class="et-profile-chart-row"><div class="et-profile-chart-label"><span>${esc(category)}</span><b>${money(amount)}</b></div><div class="et-profile-track"><span style="width:${Math.max(3, Math.min(100, spent ? amount / spent * 100 : 0))}%;--et-delay:${i * 90}ms"></span></div></div>`).join('')}</div>` : '<div class="et-profile-empty"><span aria-hidden="true">🌿</span><b>Chưa có chi tiêu chung</b><small>Những khoản chi gia đình do thành viên này thực hiện sẽ hiển thị tại đây.</small></div>';
+    const history = filtered.length ? `<div class="et-profile-history">${filtered.slice(0, active === 'transactions' ? 80 : 5).map(t => `<article class="et-profile-tx"><span class="et-profile-tx-icon" aria-hidden="true">${t.type === 'in' ? '💰' : t.type === 'out' ? '🧾' : '🔄'}</span><div class="et-profile-tx-info"><b>${esc(t.note || (t.type === 'transfer' ? 'Chuyển ví' : cname(t)))}</b><small>${fdate(t.date)} · ${esc(t.type === 'transfer' ? 'Chuyển ví' : cname(t))}</small></div><strong class="${t.type === 'in' ? 'inc' : t.type === 'out' ? 'exp' : ''}">${t.type === 'out' ? '−' : t.type === 'in' ? '+' : ''}${money(t.amount)}</strong><button type="button" class="sm" data-act="viewTx" data-id="${esc(t.id)}" aria-label="Xem giao dịch">${ic('i-eye')}</button></article>`).join('')}</div>` : '<div class="et-profile-empty"><span aria-hidden="true">📭</span><b>Không có giao dịch phù hợp</b><small>Hãy chọn kỳ khác hoặc thêm giao dịch dùng chung.</small></div>';
+    return `<section class="et-profile-page et-enter">
+      <div class="et-profile-toolbar"><button type="button" class="et-back-btn" data-act="backFamilyMembers">${ic('s-left', 1)} Quay lại thành viên</button><span class="et-profile-breadcrumb">🏠 Gia đình / Thành viên / Hồ sơ</span></div>
+      <div class="et-profile-hero">
+        <span class="et-hero-sticker et-sticker-one" aria-hidden="true">✨</span><span class="et-hero-sticker et-sticker-two" aria-hidden="true">💙</span><span class="et-hero-sticker et-sticker-three" aria-hidden="true">⭐</span>
+        <div class="et-profile-avatar"><span role="img" aria-label="Biểu tượng thành viên">${emoji}</span><i aria-hidden="true">${isOwner ? '👑' : member.role === 'MANAGER' ? '🌟' : '💫'}</i></div>
+        <div class="et-profile-identity"><span class="et-profile-eyebrow">HỒ SƠ THÀNH VIÊN</span><h2>${esc(name)}</h2><div class="et-profile-chips"><span class="et-relation-pill">${emoji} ${esc(relation)}</span><span class="family-role-badge role-${roleToken}">${esc(familyRole(member.role))}</span><span class="family-member-status">Đang tham gia</span></div><p>Thành viên của ${esc(family.name)} · ${esc(member.userEmail)}</p></div>
+        ${canUpdateInfo ? `<button class="et-profile-edit" type="button" data-act="editFamilyRelationship" data-id="${esc(member.userEmail)}">${ic('i-pen-to-square')} Chỉnh sửa hồ sơ</button>` : ''}
+      </div>
+      <div class="et-profile-nav" role="group" aria-label="Các mục hồ sơ">
+        ${[['overview', '🏡 Tổng quan'], ['transactions', '🧾 Chi tiêu'], ['permissions', '🛡️ Quyền hạn'], ['info', '👤 Thông tin']].map(([key, title]) => `<button type="button" class="et-profile-tab ${active === key ? 'active' : ''}" data-act="familyProfileTab" data-id="${key}" ${active === key ? 'aria-current="page"' : ''}>${title}</button>`).join('')}
+      </div>
+      ${['overview', 'transactions'].includes(active) ? `<div class="et-profile-period"><label for="familyProfileMonth">📅 Thống kê theo tháng</label><input type="month" id="familyProfileMonth" value="${esc(period === 'all' ? monthNow() : period)}"><button type="button" class="sm ${period === 'all' ? 'et-period-active' : ''}" data-act="familyProfileAll">Tất cả</button></div>
+        <div class="et-profile-kpis"><div class="et-profile-kpi"><span aria-hidden="true">💸</span><small>Tổng chi tiêu chung</small><strong>${money(spent)}</strong></div><div class="et-profile-kpi"><span aria-hidden="true">🪙</span><small>Tổng thu chung</small><strong>${money(earned)}</strong></div><div class="et-profile-kpi"><span aria-hidden="true">📋</span><small>Giao dịch</small><strong>${filtered.length}</strong></div></div>` : ''}
+      ${active === 'overview' ? `<div class="et-profile-columns"><div class="et-profile-section"><h3>📊 Phân bổ chi tiêu</h3><p class="et-profile-muted">Chỉ tính các khoản chi gia đình của thành viên</p>${graph}</div><div class="et-profile-section"><h3>🌈 Thông tin nhanh</h3><div class="et-profile-facts"><div><span>Quan hệ gia đình</span><b>${emoji} ${esc(relation)}</b></div><div><span>Quyền hệ thống</span><b>${esc(familyRole(member.role))}</b></div><div><span>Ngày tham gia</span><b>${member.joinedAt ? fdate(member.joinedAt.slice(0, 10)) : 'Chưa rõ'}</b></div></div><div class="et-profile-privacy">🔒 Dữ liệu chi tiêu cá nhân luôn được giữ riêng tư.</div></div></div><div class="et-profile-section"><div class="et-profile-section-head"><h3>🧾 Giao dịch gần đây</h3><button type="button" class="sm" data-act="familyProfileTab" data-id="transactions">Xem toàn bộ →</button></div>${history}</div>` : ''}
+      ${active === 'transactions' ? `<div class="et-profile-section"><div class="et-profile-section-head"><div><h3>🧾 Lịch sử giao dịch chung</h3><p class="et-profile-muted">${filtered.length} giao dịch trong kỳ đã chọn</p></div></div>${history}${filtered.length > 80 ? '<p class="et-profile-muted">Đang hiển thị 80 giao dịch gần nhất. Mở tab Giao dịch gia đình để lọc và xuất đầy đủ.</p>' : ''}</div><div class="et-profile-section"><h3>📊 Danh mục chi tiêu</h3>${graph}</div>` : ''}
+      ${active === 'permissions' ? `<div class="et-profile-columns"><div class="et-profile-section"><h3>🛡️ Quyền hiện tại</h3><div class="et-role-highlight"><span aria-hidden="true">${isOwner ? '👑' : member.role === 'MANAGER' ? '🌟' : '🤝'}</span><div><b>${esc(familyRole(member.role))}</b><small>${isOwner ? 'Toàn quyền quản lý gia đình và phân vai trò.' : member.role === 'MANAGER' ? 'Quản lý ngân sách, giao dịch chung và lời mời.' : 'Theo dõi, ghi nhận khoản chung và sửa giao dịch do mình tạo.'}</small></div></div><ul class="et-permission-list"><li>✅ Xem dữ liệu chi tiêu chung</li><li>✅ Thêm giao dịch gia đình</li><li>${isOwner || member.role === 'MANAGER' ? '✅' : '🔒'} Quản lý ngân sách và giao dịch chung của người khác</li><li>${isOwner ? '✅' : '🔒'} Phân quyền thành viên / giải tán gia đình</li></ul></div><div class="et-profile-section"><h3>⚙️ Quản lý quyền hạn</h3><p class="et-profile-muted">Quan hệ Bố/Mẹ/Anh/Chị không ảnh hưởng đến quyền truy cập.</p>${isOwner ? '<div class="et-profile-privacy">👑 Đây là chủ gia đình. Không thể hạ quyền trực tiếp. Việc chuyển chủ sở hữu cần quy trình xác thực riêng và chưa được triển khai.</div>' : canUpdateRole ? `<button type="button" class="btn-primary" data-act="editFamilyRole" data-id="${esc(member.userEmail)}">${ic('i-shield-halved')} Thay đổi quyền</button>` : '<div class="et-profile-privacy">🔒 Chỉ chủ gia đình có quyền thay đổi vai trò.</div>'}${canRemove ? `<div class="et-profile-danger"><p>Loại khỏi gia đình sẽ không xóa tài khoản cá nhân hay lịch sử chi chung.</p><button type="button" class="sm red" data-act="removeFamilyMember" data-id="${esc(member.userEmail)}">Loại khỏi gia đình</button></div>` : ''}</div></div>` : ''}
+      ${active === 'info' ? `<div class="et-profile-columns"><div class="et-profile-section"><h3>👤 Thông tin thành viên</h3><div class="et-profile-facts"><div><span>Họ và tên</span><b>${esc(name)}</b></div><div><span>Quan hệ trong gia đình</span><b>${emoji} ${esc(relation)}</b></div><div><span>Email tài khoản</span><b>${esc(member.userEmail)}</b></div><div><span>Trạng thái</span><b>🟢 Đang tham gia</b></div><div><span>Ngày tham gia</span><b>${member.joinedAt ? fdate(member.joinedAt.slice(0, 10)) : 'Chưa rõ'}</b></div></div></div><div class="et-profile-section"><h3>💬 Ghi chú gia đình</h3><p class="et-profile-muted et-profile-note">${member.familyNote ? esc(member.familyNote) : 'Chưa có ghi chú cho thành viên.'}</p>${canUpdateInfo ? `<button type="button" class="btn-ghost-d" data-act="editFamilyRelationship" data-id="${esc(member.userEmail)}">${ic('i-pen-to-square')} Sửa thông tin</button>` : '<p class="et-profile-muted">Bạn chỉ có quyền xem thông tin.</p>'}<div class="et-profile-privacy">🔒 Ghi chú chỉ hiển thị trong không gian gia đình đang đăng nhập trên thiết bị này.</div></div></div>` : ''}
+    </section>`;
+  };
+
   const familyMembersTab = familyId => {
     const family = familyOf(familyId);
     const members = familyMembersOf(familyId).map(member => ({ ...member, user: findUser(member.userEmail) }));
     const pending = familyPendingRequests(familyId);
-    const owner = members.find(member => member.role === 'OWNER');
-    return `<div class="family-member-panel">
-      ${owner ? `<div class="family-action-row"><h3 class="card-title">THÀNH VIÊN GIA ĐÌNH</h3>${owner.userEmail === session.email ? `<button type="button" class="btn-primary" data-act="inviteMember">${ic('s-plus', 1)}Mời thành viên</button>` : ''}</div>` : ''}
-      <div class="family-member-grid">${members.map(member => `<article class="family-member-card"><div class="family-member-icon">👤</div><div class="family-member-body"><h3>${esc(member.user?.name || member.userEmail)}</h3><p>${member.role === 'OWNER' ? 'OWNER' : 'MEMBER'}</p><small>Chi tháng này: ${money((db.tx.filter(t => t.scope === 'family' && t.familyId === familyId && t.owner === member.userEmail && t.type === 'out').reduce((sum, tx) => sum + Number(tx.amount || 0), 0)))} · ${db.tx.filter(t => t.scope === 'family' && t.familyId === familyId && t.owner === member.userEmail).length} giao dịch</small>${session.email === family.ownerEmail && member.userEmail !== session.email ? `<div class="family-inline-actions"><button type="button" class="sm red" data-act="removeFamilyMember" data-id="${esc(member.userEmail)}">Xóa thành viên</button></div>` : ''}</div></article>`).join('')}</div>
-      ${pending.length ? `<div class="family-requests"><h3 class="card-title">YÊU CẦU THAM GIA</h3>${pending.map(member => `<div class="family-request-row"><div><strong>${esc(findUser(member.userEmail)?.name || member.userEmail)}</strong><small>Email: ${esc(member.userEmail)}</small></div><div class="family-inline-actions"><button type="button" class="sm" data-act="acceptFamilyMember" data-id="${esc(member.userEmail)}">Chấp nhận</button><button type="button" class="sm red" data-act="rejectFamilyMember" data-id="${esc(member.userEmail)}">Từ chối</button></div></div>`).join('')}</div>` : ''}
+    const canManage = canManageFamily(familyId);
+    const selected = members.find(m => m.userEmail === S.familyProfileEmail);
+    if (selected) return familyMemberProfile(familyId, selected);
+    const month = monthNow();
+    const owners = members.filter(m => m.role === 'OWNER').length;
+    const managers = members.filter(m => m.role === 'MANAGER').length;
+    return `<div class="family-member-panel et-members-panel et-enter">
+      <div class="family-action-row et-members-heading"><div><span class="dashboard-eyebrow">👨‍👩‍👧‍👦 KHÔNG GIAN GIA ĐÌNH</span><h3 class="card-title">THÀNH VIÊN GIA ĐÌNH</h3><p class="et-profile-muted">Quan hệ gia đình và quyền truy cập được quản lý độc lập.</p></div>${canManage ? `<button type="button" class="btn-primary" data-act="inviteMember">${ic('s-plus', 1)}Mời thành viên ✨</button>` : ''}</div>
+      <div class="et-members-overview"><div><span aria-hidden="true">🏡</span><strong>${members.length}</strong><small>Đang tham gia</small></div><div><span aria-hidden="true">👑</span><strong>${owners}</strong><small>Chủ gia đình</small></div><div><span aria-hidden="true">🌟</span><strong>${managers}</strong><small>Quản lý tài chính</small></div></div>
+      <div class="family-member-grid et-members-grid">${members.map((member, i) => {
+        const data = familyTransactionFor(familyId, member.userEmail, month);
+        const spent = data.filter(t => t.type === 'out').reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+        const isOwner = member.role === 'OWNER';
+        const roleToken = isOwner ? 'owner' : member.role === 'MANAGER' ? 'manager' : 'member';
+        const [key, rel, emoji] = familyRelationship(member);
+        const canUpdate = canManage || member.userEmail === session.email;
+        return `<article class="family-member-card et-member-card" style="--et-card-order:${i}"><span class="et-member-corner" aria-hidden="true">${isOwner ? '👑' : member.role === 'MANAGER' ? '🌟' : '💫'}</span><div class="et-member-header"><div class="family-member-icon et-member-avatar" aria-hidden="true">${emoji}</div><div class="family-member-body"><h3>${esc(member.user?.name || member.userEmail)}</h3><span class="et-member-relation">${esc(rel)} ${!key ? '· cần cập nhật' : ''}</span></div></div><div class="et-member-tags"><span class="family-role-badge role-${roleToken}">${esc(familyRole(member.role))}</span><span class="family-member-status">Đang tham gia</span></div><div class="et-member-expense"><small>💸 Chi tiêu chung tháng này</small><strong>${money(spent)}</strong><span>${data.length} giao dịch</span></div><div class="et-member-actions"><button type="button" class="btn-ghost-d" data-act="openFamilyProfile" data-id="${esc(member.userEmail)}">${ic('i-eye')} Xem hồ sơ</button>${canUpdate ? `<button type="button" class="sm et-member-edit" data-act="editFamilyRelationship" data-id="${esc(member.userEmail)}" aria-label="Chỉnh sửa quan hệ gia đình">${ic('i-pen-to-square')}</button>` : ''}</div></article>`;
+      }).join('')}</div>
+      <div class="family-permission-note et-family-help"><strong>💡 Quan hệ ≠ quyền quản lý</strong><span>“Bố, Mẹ, Anh, Chị…” là mối quan hệ; “Chủ gia đình, Quản lý tài chính, Thành viên” là quyền trong phần mềm.</span><span>🔒 Khoản chi cá nhân của mỗi người không xuất hiện trong thống kê gia đình.</span><span>Chọn <b>Xem hồ sơ</b> để xem giao dịch chung, chỉnh sửa quan hệ và quyền hạn.</span></div>
+      ${pending.length ? `<div class="family-requests"><h3 class="card-title">YÊU CẦU THAM GIA</h3>${pending.map(member => `<div class="family-request-row"><div><strong>${esc(findUser(member.userEmail)?.name || member.userEmail)}</strong><small>Email: ${esc(member.userEmail)}</small></div>${canManage ? `<div class="family-inline-actions"><button type="button" class="sm" data-act="acceptFamilyMember" data-id="${esc(member.userEmail)}">Chấp nhận</button><button type="button" class="sm red" data-act="rejectFamilyMember" data-id="${esc(member.userEmail)}">Từ chối</button></div>` : '<span class="badge warn">Đang chờ duyệt</span>'}</div>`).join('')}</div>` : ''}
+      ${canManage && familyInvitesFor(familyId).length ? `<div class="family-requests"><h3 class="card-title">LỜI MỜI ĐANG CHỜ</h3>${familyInvitesFor(familyId).map(invite => `<div class="family-request-row"><div><strong>${esc(invite.email)}</strong><small>${esc(familyRelationship(invite)[1])} · Đã mời ${formatTimestamp(invite.createdAt)}</small></div><button type="button" class="sm red" data-act="cancelFamilyInvite" data-id="${esc(invite.id)}">Hủy lời mời</button></div>`).join('')}</div>` : ''}
     </div>`;
   };
   const familyBudgetTab = familyId => {
     const family = familyOf(familyId);
-    const transactions = db.tx.filter(t => t.scope === 'family' && t.familyId === familyId).filter(t => t.type === 'out');
+    const month = monthRe.test(S.familyBudgetMonth || '') ? S.familyBudgetMonth : monthNow();
+    const transactions = db.tx.filter(t => t.scope === 'family' && t.familyId === familyId && t.date.startsWith(month) && t.type === 'out');
     const spent = transactions.reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
     const budget = Number(family?.monthlyBudget || 0);
     const remaining = budget - spent;
-    const ratio = budget ? Math.min(100, (spent / budget) * 100) : 0;
+    const ratio = budget ? (spent / budget) * 100 : 0;
     const used = budget ? Math.max(0, Math.min(100, ratio)) : 0;
+    const budgetState = budgetStatus(spent, budget);
+    const budgetStateClass = budgetState === 'exhausted' ? 'warn' : budgetState;
+    const canManage = canManageFamily(familyId);
+    const entries = familyBudgets(familyId, month);
+    const editing = entries.find(entry => entry.id === S.editFamilyCategoryBudget);
+    const categoryBudgets = entries.slice().sort((a, b) => familyBudgetSpent(b) / Math.max(Number(b.amount), 1) - familyBudgetSpent(a) / Math.max(Number(a.amount), 1));
     return `<div class="family-budget-wrap">
-      <div class="family-budget-header"><div><span>Ngân sách tháng</span><strong>${money(budget || 0)}</strong></div><div><span>Đã sử dụng</span><strong>${money(spent)}</strong></div><div><span>Còn lại</span><strong>${money(remaining)}</strong></div></div>
-      <div class="family-progress"><div class="family-progress-bar" style="width:${used}%"></div></div>
-      <div class="family-progress-label"><span>${Math.round(used)}%</span></div>
-      <div class="family-budget-list"><div class="family-budget-item"><span>Ăn uống</span><strong>${money(transactions.filter(tx => cname(tx).includes('Ăn')).reduce((sum, tx) => sum + Number(tx.amount || 0), 0) || 0)}</strong></div><div class="family-budget-item"><span>Điện nước</span><strong>${money(transactions.filter(tx => cname(tx).includes('Điện') || cname(tx).includes('Nước')).reduce((sum, tx) => sum + Number(tx.amount || 0), 0) || 0)}</strong></div><div class="family-budget-item"><span>Giáo dục</span><strong>${money(transactions.filter(tx => cname(tx).includes('Học') || cname(tx).includes('Giáo')).reduce((sum, tx) => sum + Number(tx.amount || 0), 0) || 0)}</strong></div><div class="family-budget-item"><span>Khác</span><strong>${money(transactions.filter(tx => !cname(tx).includes('Ăn') && !cname(tx).includes('Điện') && !cname(tx).includes('Nước') && !cname(tx).includes('Học') && !cname(tx).includes('Giáo')).reduce((sum, tx) => sum + Number(tx.amount || 0), 0) || 0)}</strong></div></div>
+      <div class="family-budget-title"><div><span class="dashboard-eyebrow">NGÂN SÁCH · ${esc(month)}</span><h3>Ngân sách gia đình</h3></div><label class="family-budget-period">Tháng <input id="familyBudgetMonth" type="month" value="${esc(month)}"></label>${canManage ? `<button type="button" class="sm" data-act="toggleFamilyBudget">${ic('i-pen-to-square')}${S.editFamilyBudget ? 'Đóng điều chỉnh' : 'Điều chỉnh ngân sách chung'}</button>` : ''}</div>
+      ${S.editFamilyBudget && canManage ? `<form class="family-budget-edit" data-f="familyBudgetSettings" novalidate>${field('familyBudgetAmount', 'Ngân sách tháng (₫)', 'i-coins', { type: 'number', val: budget, attr: 'min="0" step="1000"' })}<div class="actions"><button type="button" class="btn-ghost-d" data-act="toggleFamilyBudget">Hủy</button><button class="btn-primary">Lưu ngân sách</button></div></form>` : ''}
+      <div class="family-budget-header"><div><span>Ngân sách tháng</span><strong>${money(budget)}</strong></div><div><span>Đã sử dụng</span><strong>${money(spent)}</strong></div><div><span>Còn lại</span><strong>${money(remaining)}</strong></div></div>
+      <div class="family-progress"><div class="family-progress-bar ${budgetStateClass}" style="width:${used}%"></div></div>
+      <div class="family-progress-label ${budgetStateClass}"><span>${Math.round(budget ? ratio : 0)}%${budgetState === 'over' ? ' · Vượt ngân sách' : budgetState === 'exhausted' ? ' · Đã dùng hết ngân sách' : budgetState === 'warn' ? ' · Đã sử dụng ít nhất 80%' : ''}</span></div>
+      ${budget && budgetState !== 'ok' ? `<div class="family-budget-alert ${budgetStateClass}">${budgetState === 'over' ? `Gia đình đã vượt ngân sách ${money(spent - budget)}.` : budgetState === 'exhausted' ? 'Gia đình đã sử dụng đúng 100% ngân sách tháng.' : 'Lưu ý: chi tiêu gia đình đã đạt ít nhất 80% ngân sách tháng.'}</div>` : ''}
+      <section class="family-category-budgets"><div class="family-budget-title"><div><span class="dashboard-eyebrow">HẠN MỨC THEO DANH MỤC</span><h3>${esc(month)}</h3></div></div>
+        ${canManage ? `<form class="family-budget-edit" data-f="familyCategoryBudget" novalidate>${field('familyBudgetCategoryCat', 'Danh mục Chi', 'i-layer-group', { tag: 'select', opts: catOpts(editing?.catId || '', 'Chọn danh mục Chi', 'out', [catOf(editing?.catId)], 'family', familyId) })}<div class="grid2">${field('familyBudgetCategoryMonth', 'Tháng', 's-cal', { type: 'month', val: editing?.month || month })}${field('familyBudgetCategoryAmount', 'Hạn mức (₫)', 'i-coins', { type: 'number', val: editing?.amount, attr: 'min="1" step="any"' })}</div><div class="actions">${editing ? '<button type="button" class="btn-ghost-d" data-act="cancelFamilyCategoryBudget">HỦY</button>' : ''}<button class="btn-primary">${editing ? 'Lưu hạn mức' : 'Thêm hạn mức danh mục'}</button></div></form>` : ''}
+        <div class="family-budget-list">${categoryBudgets.length ? categoryBudgets.map(entry => {
+          const actual = familyBudgetSpent(entry), status = budgetStatus(actual, entry.amount), state = status === 'exhausted' ? 'warn' : status;
+          const pct = progress(actual, entry.amount);
+          const alert = status === 'over' ? `Vượt hạn mức ${money(actual - entry.amount)}` : status === 'exhausted' ? 'Đã dùng hết 100%' : status === 'warn' ? 'Đã dùng ít nhất 80%' : 'Trong hạn mức';
+          return `<article class="family-category-budget"><div class="family-budget-title"><div><h4>${esc(catOf(entry.catId)?.name || 'Danh mục đã xóa')}</h4><span>${esc(entry.month)}</span></div><span class="family-budget-state ${state}">${alert}</span>${canManage ? `<div class="cell-act"><button type="button" class="sm" data-act="editFamilyCategoryBudget" data-id="${esc(entry.id)}">Sửa</button><button type="button" class="sm red" data-act="delFamilyCategoryBudget" data-id="${esc(entry.id)}">Xóa</button></div>` : ''}</div>
+            <div class="family-progress"><div class="family-progress-bar ${state}" style="width:${pct}%"></div></div><div class="progress-caption"><b>${money(actual)} đã dùng</b><span>${pct}%</span><span>Hạn mức ${money(entry.amount)}</span></div>
+            ${status !== 'ok' ? `<p class="family-budget-alert ${state}">${alert} · ${money(actual)} / ${money(entry.amount)}.</p>` : ''}</article>`;
+        }).join('') : '<div class="chart-empty">Chưa đặt hạn mức theo danh mục cho tháng này.</div>'}</div>
+      </section>
     </div>`;
   };
+  const familyFundTab = familyId => {
+    const entries = db.familyFundEntries.filter(entry => entry.familyId === familyId).slice().sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+    const contributions = entries.filter(entry => entry.type === 'contribution').reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+    const used = entries.filter(entry => entry.type === 'use').reduce((sum, entry) => sum + Number(entry.amount || 0), 0);
+    const balance = contributions - used;
+    return `<section class="family-fund-ledger">
+      <div class="family-action-row"><div><span class="dashboard-eyebrow">QUỸ GIA ĐÌNH</span><h3 class="card-title">SỔ QUỸ CHUNG</h3><p class="family-fund-explainer">Theo dõi riêng các khoản đóng góp và sử dụng quỹ. Lịch sử được lưu độc lập với giao dịch cá nhân.</p></div><div class="family-inline-actions"><button type="button" class="btn-ghost-d" data-act="addFamilyFundEntry" data-id="contribution">${ic('s-plus', 1)}Đóng góp</button>${canManageFamily(familyId) ? `<button type="button" class="btn-primary" data-act="addFamilyFundEntry" data-id="use">${ic('i-arrow-up-right-from-square')}Ghi nhận sử dụng</button>` : ''}</div></div>
+      <div class="family-fund-metrics"><article><span>Tổng đóng góp</span><strong class="inc">${money(contributions)}</strong></article><article><span>Đã sử dụng</span><strong class="exp">${money(used)}</strong></article><article><span>Số dư quỹ</span><strong>${money(balance)}</strong></article></div>
+      <div class="family-requests"><h3 class="card-title">LỊCH SỬ QUỸ</h3>${entries.length ? `<div class="family-fund-history">${entries.map(entry => { const isContribution = entry.type === 'contribution'; return `<article class="family-fund-entry"><span class="family-fund-entry-icon ${isContribution ? 'contribution' : 'use'}">${isContribution ? '+' : '−'}</span><div><strong>${isContribution ? 'Đóng góp vào quỹ' : 'Sử dụng quỹ'}</strong><small>${esc(uname(entry.owner))} · ${fdate(entry.date || entry.createdAt?.slice(0, 10))}${entry.note ? ` · ${esc(entry.note)}` : ''}</small></div><strong class="${isContribution ? 'inc' : 'exp'}">${isContribution ? '+' : '−'}${money(entry.amount)}</strong></article>`; }).join('')}</div>` : '<div class="chart-empty">Chưa có biến động quỹ. Ghi nhận khoản đóng góp đầu tiên.</div>'}</div>
+    </section>`;
+  };
+  const familyInviteInbox = () => {
+    const invites = familyInvitesToMe();
+    if (!invites.length) return '';
+    return `<section class="family-invite-inbox"><div><span class="dashboard-eyebrow">LỜI MỜI</span><h3>Bạn được mời tham gia gia đình</h3></div>${invites.map(invite => { const family = familyOf(invite.familyId); return family ? `<article class="family-invite-card"><div><strong>${esc(family.name)}</strong><small>${esc(uname(invite.inviterEmail))} đã mời bạn · ${formatTimestamp(invite.createdAt)}</small></div><div class="family-inline-actions"><button type="button" class="sm" data-act="acceptFamilyInvite" data-id="${esc(invite.id)}">Chấp nhận</button><button type="button" class="sm red" data-act="rejectFamilyInvite" data-id="${esc(invite.id)}">Từ chối</button></div></article>` : ''; }).join('')}</section>`;
+  };
   const familyReportTab = familyId => {
-    const { family, transactions, totalSpent, byCategory } = familySummaryData(familyId);
+    const { transactions, byCategory } = familySummaryData(familyId);
+    const income = transactions.filter(t => t.type === 'in').reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+    const expense = transactions.filter(t => t.type === 'out').reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
     return `<div class="family-report-grid">
-      <div class="family-report-stat"><span>Tổng chi</span><strong>${money(totalSpent)}</strong></div>
-      <div class="family-report-stat"><span>Tổng thu</span><strong>${money(transactions.filter(t => t.type === 'in').reduce((sum, tx) => sum + Number(tx.amount || 0), 0))}</strong></div>
+      <div class="family-report-stat"><span>Tổng chi lũy kế</span><strong>${money(expense)}</strong></div>
+      <div class="family-report-stat"><span>Tổng thu lũy kế</span><strong>${money(income)}</strong></div>
+      <div class="family-report-stat"><span>Chênh lệch lũy kế</span><strong>${money(income - expense)}</strong></div>
       <div class="family-report-stat"><span>Số giao dịch</span><strong>${transactions.length}</strong></div>
-      <div class="family-report-stat"><span>Ngân sách đã sử dụng</span><strong>${family ? money(Math.min(Number(family.monthlyBudget || 0), totalSpent)) : money(0)}</strong></div>
       <div class="family-report-chart"><h3>Chi tiêu theo danh mục</h3>${Object.keys(byCategory).length ? pie(byCategory) : '<div class="chart-empty">Chưa có dữ liệu để tạo báo cáo.</div>'}</div>
     </div>`;
   };
   const familySettingsTab = familyId => {
     const family = familyOf(familyId);
     if (!family) return '<div class="chart-empty">Chưa có gia đình</div>';
+    if (family.ownerEmail !== session.email) return `<div class="family-settings-form"><h3>Cài đặt gia đình</h3><p>Chỉ chủ gia đình mới có thể thay đổi thông tin hoặc giải tán gia đình.</p><div class="family-code-row"><label>Mã gia đình</label><div class="family-code-box">${esc(family.code || 'FAM-000000')}</div><button type="button" class="btn-ghost-d" data-act="copyFamilyCode">Sao chép mã</button></div></div>`;
     return `<form class="family-settings-form" data-f="familySettings" novalidate>
       <div class="grid2">${field('familyName', 'Tên gia đình', 'i-users', { val: family.name })}${field('familyBudget', 'Ngân sách tháng', 'i-coins', { type: 'number', val: family.monthlyBudget || 0, attr: 'min="0" step="1000"' })}</div>
       ${field('familyDescription', 'Mô tả', 'i-receipt', { tag: 'textarea', val: family.description || '' })}
@@ -660,9 +1421,9 @@
   const familyPage = () => {
     const memberships = myFamilyMemberships();
     if (!memberships.length) {
-      return `<div class="family-empty card"><div class="family-empty-title">👨‍👩‍👧‍👦 Quản lý chi tiêu gia đình</div><p>Quản lý các khoản chi tiêu chung của gia đình cùng các thành viên.</p><div class="family-empty-actions"><button type="button" class="btn-primary" data-act="createFamily">${ic('s-plus', 1)}Tạo gia đình</button><button type="button" class="btn-ghost-d" data-act="joinFamily">Tham gia bằng mã</button></div><div class="family-empty-why"><h3>Tại sao nên tạo gia đình?</h3><ul><li>• Theo dõi chi tiêu chung</li><li>• Quản lý ngân sách gia đình</li><li>• Theo dõi chi tiêu từng thành viên</li><li>• Xem báo cáo tài chính gia đình</li></ul></div></div>`;
+      return `${familyInviteInbox()}<div class="family-empty card"><div class="family-empty-title">👨‍👩‍👧‍👦 Quản lý chi tiêu gia đình</div><p>Quản lý các khoản chi tiêu chung của gia đình cùng các thành viên.</p><div class="family-empty-actions"><button type="button" class="btn-primary" data-act="createFamily">${ic('s-plus', 1)}Tạo gia đình</button><button type="button" class="btn-ghost-d" data-act="joinFamily">Tham gia bằng mã</button></div><div class="family-empty-why"><h3>Tại sao nên tạo gia đình?</h3><ul><li>• Theo dõi chi tiêu chung</li><li>• Quản lý ngân sách gia đình</li><li>• Theo dõi chi tiêu từng thành viên</li><li>• Xem báo cáo tài chính gia đình</li></ul></div></div>`;
     }
-    const familyId = memberships[0].familyId;
+    const familyId = activeFamilyId();
     const family = familyOf(familyId);
     if (!family) return `<div class="family-empty card"><p>Chưa có gia đình</p></div>`;
     const activeTab = S.familyTab || 'overview';
@@ -670,16 +1431,18 @@
       overview: familyOverviewTab(familyId),
       transactions: familyTransactionsTab(familyId),
       members: familyMembersTab(familyId),
+      fund: familyFundTab(familyId),
       budget: familyBudgetTab(familyId),
       report: familyReportTab(familyId),
       settings: familySettingsTab(familyId)
     };
-    return `<div class="family-shell">
+    return `${familyInviteInbox()}<div class="family-shell">
       <div class="card family-header-card">
         <div class="family-header-copy">
           <span class="dashboard-eyebrow">GIA ĐÌNH</span>
           <h2>${esc(family.name)}</h2>
         </div>
+        ${memberships.length > 1 ? `<label class="family-selector-label">Không gian<select id="familySelector" class="family-filter" data-live>${opt(memberships.map(member => [member.familyId, familyOf(member.familyId)?.name || 'Gia đình']), familyId)}</select></label>` : ''}
         <div class="family-header-meta">
           <div><span>Chủ gia đình</span><strong>${esc(findUser(family.ownerEmail)?.name || family.ownerEmail)}</strong></div>
           <div><span>Mã gia đình</span><strong>${esc(family.code || 'FAM-000000')}</strong></div>
@@ -692,59 +1455,100 @@
   };
   const goalPage = () => {
     const e = myGoals().find(g => g.id === S.editGoal) || {};
-    const entries = myGoals().slice().sort((a, b) => a.deadline.localeCompare(b.deadline));
+    const entries = myGoals().slice().sort((a, b) => (a.deadline || '').localeCompare(b.deadline || ''));
     return `<form class="card" data-f="goal" novalidate><h2 class="card-title">${e.id ? 'SỬA' : 'TẠO'} MỤC TIÊU TIẾT KIỆM</h2>
       <div class="grid2">${field('gname', 'Tên mục tiêu', 'i-piggy-bank', { val: e.name })}${field('gtarget', 'Số tiền mục tiêu (₫)', 'i-coins', { type: 'number', val: e.target, attr: 'min="1"' })}
-      ${field('gsaved', 'Đã tiết kiệm (₫)', 'i-wallet', { type: 'number', val: e.saved || 0, attr: 'min="0"' })}${field('gdate', 'Ngày hoàn thành', 's-cal', { type: 'date', val: e.deadline })}</div>
+      ${e.id ? `<div class="goal-current-saving"><span>Đã tiết kiệm</span><strong>${money(goalSaved(e))}</strong><small>Thay đổi số tiền bằng chức năng đóng góp hoặc rút tiền.</small></div>` : field('gsaved', 'Số dư tiết kiệm ban đầu (₫)', 'i-wallet', { type: 'number', val: 0, attr: 'min="0" step="any"' })}
+      ${field('gdate', 'Ngày hoàn thành', 's-cal', { type: 'date', val: e.deadline })}</div>
       ${field('gnote', 'Ghi chú', 'i-receipt', { tag: 'textarea', val: e.note })}
+      <p class="family-form-hint">Đóng góp và rút tiền được ghi nhận là chuyển khoản giữa ví của bạn và ví mục tiêu; không tính thành thu nhập hoặc chi phí.</p>
       <div class="actions">${e.id ? '<button type="button" class="btn-ghost-d" data-act="cancelGoal">HỦY</button>' : ''}<button class="btn-primary">${e.id ? 'LƯU THAY ĐỔI' : 'TẠO MỤC TIÊU'}</button></div></form>
       <div class="card"><div class="card-head"><h2 class="card-title">MỤC TIÊU CỦA TÔI</h2><span class="badge">${entries.length} mục tiêu</span></div>
       ${entries.length ? `<div class="progress-list">${entries.map(g => {
-        const pct = progress(g.saved, g.target), done = Number(g.saved) >= Number(g.target);
-        return `<article class="progress-item"><div class="card-head"><div><h3>${esc(g.name)}</h3><small>${g.deadline ? `Hoàn thành trước ${fdate(g.deadline)}` : 'Chưa đặt ngày hoàn thành'} · <span class="badge ${done ? 'ok' : ''}">${done ? 'Đã hoàn thành' : `${pct}% mục tiêu`}</span></small></div><div class="cell-act"><button class="sm" data-act="editGoal" data-id="${esc(g.id)}">${ic('i-pen-to-square')}Sửa</button><button class="sm red" data-act="delGoal" data-id="${esc(g.id)}">${ic('s-trash', 1)}Xóa</button></div></div>
-          ${progressBar(g.saved, g.target, done ? 'ok' : '')}<div class="progress-caption"><b>${money(g.saved)}</b><span>${pct}%</span><span>Mục tiêu ${money(g.target)}</span></div>${g.note ? `<p class="goal-note">${esc(g.note)}</p>` : ''}</article>`;
+        const saved = goalSaved(g), pct = progress(saved, g.target), done = saved >= Number(g.target);
+        const movements = goalMovements(g).slice(0, 3);
+        return `<article class="progress-item"><div class="card-head"><div><h3>${esc(g.name)}</h3><small>${g.deadline ? `Hoàn thành trước ${fdate(g.deadline)}` : 'Chưa đặt ngày hoàn thành'} · <span class="badge ${done ? 'ok' : ''}">${done ? 'Đã hoàn thành' : `${pct}% mục tiêu`}</span></small></div><div class="cell-act"><button class="sm" data-act="contributeGoal" data-id="${esc(g.id)}">${ic('s-plus', 1)}Đóng góp</button><button class="sm" data-act="withdrawGoal" data-id="${esc(g.id)}">Rút tiền</button><button class="sm" data-act="editGoal" data-id="${esc(g.id)}">${ic('i-pen-to-square')}Sửa</button><button class="sm red" data-act="delGoal" data-id="${esc(g.id)}">${ic('s-trash', 1)}Xóa</button></div></div>
+          ${progressBar(saved, g.target, done ? 'ok' : '')}<div class="progress-caption"><b>${money(saved)}</b><span>${pct}%</span><span>Mục tiêu ${money(g.target)}</span></div>${g.note ? `<p class="goal-note">${esc(g.note)}</p>` : ''}
+          ${movements.length ? `<div class="goal-movements"><strong>Đóng góp / rút tiền gần đây</strong>${movements.map(transaction => {
+            const deposit = transaction.toAccountId === g.accountId;
+            return `<div><span>${deposit ? 'Đóng góp' : 'Rút tiền'} · ${fdate(transaction.date)}${transaction.note ? ` · ${esc(transaction.note)}` : ''}</span><b class="${deposit ? 'inc' : 'exp'}">${deposit ? '+' : '−'}${money(transaction.amount)}</b></div>`;
+          }).join('')}</div>` : ''}</article>`;
       }).join('')}</div>` : `<div class="chart-empty">Chưa có mục tiêu tiết kiệm.</div>`}</div>`;
   };
-    const moneyAccountForm = () => `<form class="card" data-f="moneyAccount" novalidate><div class="card-head"><h2 class="card-title">THÊM TÀI KHOẢN</h2><button type="button" class="sm" data-act="cancelMoneyAccount">ĐÓNG</button></div>
+    const moneyAccountForm = () => `<form class="card money-account-form" data-f="moneyAccount" novalidate><div class="card-head"><div><span class="dashboard-eyebrow">TÀI KHOẢN MỚI</span><h2 class="card-title">THÊM VÍ / TÀI KHOẢN</h2></div><button type="button" class="sm" data-act="cancelMoneyAccount">ĐÓNG</button></div>
       ${field('aname', 'Tên tài khoản', 'i-wallet', { attr: 'maxlength="80"' })}
       <div class="grid2">${field('atype', 'Loại', 's-swap', { tag: 'select', opts: opt(ACCOUNT_TYPES, 'cash') })}${field('aopening', 'Số dư ban đầu (₫)', 'i-coins', { type: 'number', val: 0, attr: 'min="0" step="any"' })}</div>
+      ${field('accountScope', 'Không gian ví', 'i-users', { tag: 'select', opts: opt([['personal', 'Ví cá nhân'], ['family', 'Ví quỹ chung gia đình']], S.familyWalletSetup ? 'family' : 'personal') })}
+      <div id="familyAccountFields"${S.familyWalletSetup ? '' : ' hidden'}>${field('accountFamilyId', 'Gia đình', 'i-users', { tag: 'select', opts: opt(myFamilyMemberships().filter(member => canManageFamily(member.familyId)).map(member => [member.familyId, familyOf(member.familyId)?.name || 'Gia đình']), S.familyWalletSetup || '', 'Chọn gia đình') })}<small class="tx-field-hint">Ví gia đình được chia sẻ với thành viên đang hoạt động. Chỉ chủ gia đình/người quản lý có thể tạo và đối soát.</small></div>
       ${field('anote', 'Mô tả', 'i-receipt', { tag: 'textarea', attr: 'maxlength="500"' })}
-      <div class="actions"><button type="button" class="btn-ghost-d" data-act="cancelMoneyAccount">HỦY</button><button class="btn-primary">LƯU</button></div></form>`;
+      <div class="actions">${S.familyWalletSetup ? '<button type="button" class="btn-ghost-d" data-act="cancelFamilyWalletSetup">HỦY</button>' : '<button type="button" class="btn-ghost-d" data-act="cancelMoneyAccount">HỦY</button>'}<button class="btn-primary">LƯU</button></div></form>`;
   const moneyAccountsPage = () => {
-    const accounts = myAccounts(), total = accounts.reduce((sum, account) => sum + accountBalance(account), 0);
-    return `<div class="money-accounts-page"><section class="card money-accounts-card"><div class="card-head"><div><span class="dashboard-eyebrow">TÀI SẢN CỦA BẠN</span><h2 class="card-title">VÍ / TÀI KHOẢN TIỀN</h2></div><span class="badge">${accounts.length} tài khoản</span></div>
-      <div class="money-account-list">${accounts.map(account => `<article class="money-account-row"><span class="money-account-icon ${account.type}">${ic(account.type === 'wallet' ? 'i-mobile-screen-button' : 'i-wallet')}</span>
-        <div class="money-account-copy"><b>${esc(account.name)}</b><small>${esc(accountTypeLabel(account.type))}${account.note ? ` · ${esc(account.note)}` : ''}</small></div>
-        <strong>${money(accountBalance(account))}</strong></article>`).join('')}</div>
-      <div class="money-account-total"><span>TỔNG TÀI SẢN</span><strong>${money(total)}</strong></div>
-      <div class="actions"><button type="button" class="btn-primary" data-act="addMoneyAccount">${ic('s-plus', 1)}THÊM TÀI KHOẢN</button></div></section>
+    const accounts = visibleAccounts().filter(account => !account.hidden || S.showHiddenAccounts), activeAccounts = accounts.filter(account => !account.hidden);
+    const personalTotal = activeAccounts.filter(account => !accountIsFamily(account)).reduce((sum, account) => sum + accountBalance(account), 0)
+      + myGoals().reduce((sum, goal) => sum + goalSaved(goal), 0);
+    const familyTotal = activeAccounts.filter(accountIsFamily).reduce((sum, account) => sum + accountBalance(account), 0);
+    const total = personalTotal + familyTotal;
+    return `<div class="money-accounts-page"><section class="card money-accounts-card"><div class="card-head"><div><span class="dashboard-eyebrow">SỐ DƯ THEO SỔ GIAO DỊCH</span><h2 class="card-title">VÍ / TÀI KHOẢN TIỀN</h2></div><span class="badge">${activeAccounts.length} đang sử dụng</span></div>
+      <p class="money-account-intro">Số dư hiện tại = số dư đầu kỳ + giao dịch thu/chi + chuyển khoản + điều chỉnh đối soát.</p>
+      <div class="money-account-list">${accounts.map(account => { const balance = accountBalance(account); return `<article class="money-account-card ${account.hidden ? 'is-hidden' : ''}"><div class="money-account-row"><span class="money-account-icon ${esc(account.type)}">${ic(account.type === 'wallet' ? 'i-mobile-screen-button' : 'i-wallet')}</span>
+        <div class="money-account-copy"><b>${esc(account.name)}${account.hidden ? '<span class="money-hidden-badge">Đã ẩn</span>' : ''}</b><small>${esc(accountTypeLabel(account.type))} · ${accountIsFamily(account) ? `Quỹ chung · ${esc(familyOf(account.familyId)?.name || 'Gia đình')}` : 'Ví cá nhân'}${account.note ? ` · ${esc(account.note)}` : ''}</small></div>
+        <strong>${money(balance)}</strong></div><div class="money-account-meta"><span>Đầu kỳ <b>${money(account.openingBalance)}</b></span><span>Hiện tại <b>${money(balance)}</b></span></div>
+        <div class="money-account-actions"><button type="button" class="sm" data-act="showAccountLedger" data-id="${esc(account.id)}">Lịch sử</button>${!account.hidden && (!accountIsFamily(account) || canManageFamily(account.familyId)) ? `<button type="button" class="sm" data-act="reconcileAccount" data-id="${esc(account.id)}">Đối soát</button>` : ''}<button type="button" class="sm ${account.hidden ? '' : 'red'}" data-act="${account.hidden ? 'restoreAccount' : 'hideAccount'}" data-id="${esc(account.id)}">${account.hidden ? 'Hiện lại' : 'Ẩn ví'}</button></div></article>`; }).join('') || '<div class="chart-empty">Chưa có ví đang hiển thị.</div>'}</div>
+      <div class="money-account-summary"><article><span>Ví cá nhân</span><strong>${money(personalTotal)}</strong></article><article><span>Quỹ chung được chia sẻ</span><strong>${money(familyTotal)}</strong></article><article><span>Tổng số dư đang xem</span><strong>${money(total)}</strong></article></div>
+      <div class="actions"><button type="button" class="btn-primary" data-act="addMoneyAccount">${ic('s-plus', 1)}THÊM VÍ / TÀI KHOẢN</button><button type="button" class="btn-ghost-d" data-act="toggleHiddenAccounts">${S.showHiddenAccounts ? 'Ẩn ví đã lưu trữ' : 'Hiện ví đã ẩn'}</button></div></section>
       ${S.showMoneyAccountForm ? moneyAccountForm() : ''}</div>`;
   };
-  const notificationPage = () => {
-    const month = monthNow(), previous = shiftMonth(month, -1), notifications = [];
-    myBudgets().filter(b => b.month === month).forEach(b => {
-      const spent = budgetSpent(b), ratio = spent / Math.max(b.amount, 1), name = catOf(b.catId)?.name || 'Danh mục đã xóa';
-      if (ratio >= 1) notifications.push({ type: 'over', title: 'Vượt ngân sách', text: `${name}: đã chi ${money(spent)} trên ngân sách ${money(b.amount)}.` });
-      else if (ratio >= .8) notifications.push({ type: 'warn', title: 'Sắp vượt ngân sách', text: `${name}: đã dùng ${progress(spent, b.amount)}% ngân sách tháng này.` });
+  const notifyBudgetStatus = (owner, eventKey, status, titlePrefix, text, familyId = '') => {
+    if (status === 'ok') return;
+    const label = status === 'over' ? 'đã vượt ngân sách' : status === 'exhausted' ? 'đã dùng hết 100%' : 'đã sử dụng ít nhất 80%';
+    recordNotification(owner, `${eventKey}:${status}`, status === 'over' || status === 'exhausted' ? 'over' : 'warn',
+      `${titlePrefix} ${label}`, text, familyId);
+  };
+  const syncBudgetNotifications = () => {
+    const month = monthNow();
+    myBudgets().filter(budget => budget.month === month).forEach(budget => {
+      const spent = budgetSpent(budget), status = budgetStatus(spent, budget.amount);
+      const category = catOf(budget.catId)?.name || 'Danh mục đã xóa';
+      notifyBudgetStatus(session.email, `budget:personal:${budget.id}:${month}`, status, `Ngân sách cá nhân · ${category}`,
+        `Đã chi ${money(spent)} trên hạn mức ${money(budget.amount)} trong tháng ${month}.`);
     });
-    myGoals().filter(g => Number(g.saved) < Number(g.target) && progress(g.saved, g.target) >= 80).forEach(g =>
-      notifications.push({ type: 'goal', title: 'Gần đạt mục tiêu', text: `${g.name}: đã tiết kiệm ${money(g.saved)} trên ${money(g.target)}.` }));
-    const thisSpend = sum(myTx().filter(t => t.date.startsWith(month)), 'out');
-    const previousSpend = sum(myTx().filter(t => t.date.startsWith(previous)), 'out');
-    if (thisSpend > previousSpend && thisSpend > 0) notifications.push({ type: 'warn', title: 'Chi tiêu tăng so với tháng trước', text: `Chi tháng ${month} là ${money(thisSpend)}, cao hơn ${money(thisSpend - previousSpend)} so với tháng ${previous}.` });
-    const family = activeFamily();
-    if (family) {
-      const familyTx = db.tx.filter(t => t.scope === 'family' && t.familyId === family.id && t.date.startsWith(month));
-      const familySpent = familyTx.filter(t => t.type === 'out').reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
-      const familyBudget = Number(family.monthlyBudget || 0);
-      if (familyBudget > 0) {
-        const ratio = familySpent / familyBudget;
-        if (ratio >= 1) notifications.push({ type: 'over', title: 'Ngân sách gia đình đã vượt giới hạn', text: `${family.name}: đã dùng ${money(familySpent)} trên ngân sách ${money(familyBudget)}.` });
-        else if (ratio >= 0.8) notifications.push({ type: 'warn', title: 'Ngân sách gia đình đã sử dụng 80%', text: `${family.name}: đã dùng ${money(familySpent)} trên ngân sách ${money(familyBudget)}.` });
+    myFamilyMemberships().forEach(membership => {
+      const family = familyOf(membership.familyId);
+      if (!family) return;
+      const transactions = db.tx.filter(transaction => transaction.scope === 'family' && transaction.familyId === family.id
+        && transaction.date.startsWith(month) && transaction.type === 'out');
+      const spent = transactions.reduce((total, transaction) => total + Number(transaction.amount || 0), 0);
+      if (Number(family.monthlyBudget) > 0) {
+        notifyBudgetStatus(session.email, `budget:family:${family.id}:${month}`, budgetStatus(spent, family.monthlyBudget),
+          `Ngân sách chung · ${family.name}`, `Đã chi ${money(spent)} trên hạn mức ${money(family.monthlyBudget)} trong tháng ${month}.`, family.id);
       }
-    }
-    return `<div class="card"><div class="card-head"><h2 class="card-title">THÔNG BÁO THÁNG ${month}</h2><span class="badge">${notifications.length} cảnh báo</span></div>
-      ${notifications.length ? `<div class="notice-list">${notifications.map(n => `<article class="notice ${n.type}"><span class="notice-mark">${n.type === 'over' ? '!' : n.type === 'goal' ? '✓' : '↗'}</span><div><h3>${n.title}</h3><p>${esc(n.text)}</p></div></article>`).join('')}</div>` : `<div class="chart-empty">Chưa có cảnh báo. Chi tiêu và mục tiêu đang trong tầm kiểm soát.</div>`}</div>`;
+      familyBudgets(family.id, month).forEach(budget => {
+        const actual = familyBudgetSpent(budget), category = catOf(budget.catId)?.name || 'Danh mục đã xóa';
+        notifyBudgetStatus(session.email, `budget:family-category:${budget.id}:${month}`, budgetStatus(actual, budget.amount),
+          `Ngân sách gia đình · ${category}`, `Đã chi ${money(actual)} trên hạn mức ${money(budget.amount)} trong tháng ${month}.`, family.id);
+      });
+    });
+    myGoals().forEach(goal => {
+      const saved = goalSaved(goal);
+      if (saved < Number(goal.target) && progress(saved, goal.target) >= 80) {
+        recordNotification(session.email, `goal:${goal.id}:80`, 'goal', 'Mục tiêu tiết kiệm sắp hoàn thành',
+          `${goal.name}: đã tiết kiệm ${money(saved)} trên ${money(goal.target)}.`);
+      }
+      if (saved >= Number(goal.target)) {
+        recordNotification(session.email, `goal:${goal.id}:complete`, 'goal', 'Đã hoàn thành mục tiêu tiết kiệm',
+          `${goal.name}: đã đạt ${money(saved)} trên mục tiêu ${money(goal.target)}.`);
+      }
+    });
+  };
+  const notificationPage = () => {
+    const notifications = notificationsForMe(), unread = notifications.filter(notification => !notification.readAt).length;
+    const typeLabels = { over: 'Ngân sách', warn: 'Cảnh báo', recurring: 'Định kỳ', invite: 'Gia đình', fund: 'Quỹ chung', account: 'Tài khoản', goal: 'Mục tiêu' };
+    const typeIcons = { over: '!', warn: '↗', recurring: '↻', invite: '⌂', fund: '₫', account: '●', goal: '✓' };
+    return `<section class="card notifications-page"><div class="card-head"><div><span class="dashboard-eyebrow">HỘP THƯ CỦA BẠN</span><h2 class="card-title">THÔNG BÁO</h2></div><div class="head-act"><span class="badge">${unread} chưa đọc · ${notifications.length} tổng cộng</span>${unread ? `<button type="button" class="sm" data-act="markAllNotificationsRead">Đánh dấu tất cả đã đọc</button>` : ''}</div></div>
+      ${notifications.length ? `<div class="notice-list">${notifications.map(notification => `<article class="notice ${esc(notification.type)} ${notification.readAt ? 'is-read' : 'is-unread'}">
+        <span class="notice-mark">${typeIcons[notification.type] || '•'}</span><div class="notice-copy"><div class="notice-meta"><span class="badge">${esc(typeLabels[notification.type] || 'Thông báo')}</span><time>${esc(formatTimestamp(notification.createdAt))}</time></div><h3>${esc(notification.title)}</h3><p>${esc(notification.text)}</p></div>
+        ${!notification.readAt ? `<button type="button" class="sm notice-read-action" data-act="markNotificationRead" data-id="${esc(notification.id)}">Đã đọc</button>` : '<span class="notice-read-label">Đã đọc</span>'}</article>`).join('')}</div>`
+        : `<div class="chart-empty">Bạn chưa có thông báo nào.</div>`}</section>`;
   };
   const analysisPage = () => {
     const month = monthNow(), previous = shiftMonth(month, -1);
@@ -766,17 +1570,45 @@
   };
 
   /* ===== Các trang ===== */
-    const txFormCard = () => { const editing = db.tx.find(t => t.id === S.editTx && t.owner === session.email); const copied = db.tx.find(t => t.id === S.copyTx && t.owner === session.email); const e = editing || copied || {}; const familyOptions = familyScopeOptions().filter(([value]) => value !== 'personal'); return `
-        <form class="card" data-f="tx" novalidate><h2 class="card-title">${editing ? 'SỬA' : 'THÊM'} GIAO DỊCH</h2>
-          <div class="grid2">${field('type', 'Loại giao dịch', 's-swap', { tag: 'select', opts: opt(TYPES, e.type || 'out') })}<div class="amount-entry">${field('amount', 'Số tiền (₫)', 'i-coins', { type: 'number', val: e.amount, attr: 'min="1000" step="1"' })}
-          <div class="amount-presets" role="group" aria-label="Mức tiền nhập nhanh"><span>Nhập nhanh</span><button type="button" class="sm" data-act="amountPreset" data-id="10000">10.000 ₫</button><button type="button" class="sm" data-act="amountPreset" data-id="100000">100.000 ₫</button></div></div>
-          ${field('cat', 'Danh mục', 'i-layer-group', { tag: 'select', opts: catOpts(e.catId, 'Chọn danh mục', e.type || 'out') })}${field('date', 'Ngày giao dịch', 's-cal', { type: 'date', val: editing ? e.date : today(), attr: `max="${today()}"` })}</div>
-          ${field('account', 'Ví / Tài khoản', 'i-wallet', { tag: 'select', opts: opt(myAccounts().map(a => [a.id, a.name]), e.accountId || (!editing && !copied ? myAccounts().find(a => a.type === 'cash')?.id : ''), 'Chọn ví/tài khoản') })}
+    const txFormCard = () => {
+      const editing = db.tx.find(t => t.id === S.editTx && canEditFamilyTransaction(t));
+      const copied = db.tx.find(t => t.id === S.copyTx && t.owner === session.email);
+      const e = editing || copied || {};
+      const transfer = e.type === 'transfer';
+      const familyOptions = familyScopeOptions().filter(([value]) => value !== 'personal');
+      const formScope = e.scope === 'family' ? 'family' : 'personal';
+      const formFamilyId = e.familyId || activeFamilyId();
+      const editingAccounts = editing ? db.accounts.filter(account => account.id === (editing.accountId || editing.account) || account.id === editing.toAccountId) : [];
+      const accountOptions = [...new Map([...transactionAccounts(formScope, formFamilyId), ...editingAccounts].map(account => [account.id, [account.id, account.name]])).values()];
+      const editingCategory = editing ? catOf(editing.catId) : null;
+      const familyScopeControl = editing?.scope === 'family'
+        ? `<div class="family-transaction-scope-note"><input type="hidden" name="scope" value="family"><input type="hidden" name="familyId" value="${esc(editing.familyId)}"><strong>Giao dịch dùng chung</strong><span>Giữ nguyên trong không gian ${esc(familyOf(editing.familyId)?.name || 'gia đình')}.</span></div>`
+        : `<div class="family-scope-block"><label class="family-scope-radio"><input type="radio" name="scope" value="personal" ${(!e.scope || e.scope === 'personal') ? 'checked' : ''}> Cá nhân</label><label class="family-scope-radio"><input type="radio" name="scope" value="family" ${e.scope === 'family' ? 'checked' : ''}> Gia đình</label></div>`;
+      const familyField = editing?.scope === 'family' ? '' : familyOptions.length
+        ? `<div id="txFamilyFields"${formScope === 'family' ? '' : ' hidden'}>${field('familyId', 'Gia đình', 'i-users', { tag: 'select', opts: opt(familyOptions, formFamilyId, 'Chọn gia đình') })}</div>`
+        : '';
+      return `<form class="card tx-form-card" data-f="tx" novalidate>
+        <div class="tx-form-heading"><div><span class="dashboard-eyebrow">${editing?.scope === 'family' ? 'CẬP NHẬT GIAO DỊCH DÙNG CHUNG' : editing ? 'CẬP NHẬT SỔ THU CHI' : 'GHI NHẬN DÒNG TIỀN'}</span><h2 class="card-title">${editing ? 'SỬA GIAO DỊCH' : 'THÊM GIAO DỊCH'}</h2></div><span class="tx-secure-tag">${ic('i-shield-halved')} ${editing?.scope === 'family' ? 'Chia sẻ có kiểm soát' : 'Lưu riêng tư'}</span></div>
+        <div class="grid2">${field('type', 'Loại giao dịch', 's-swap', { tag: 'select', opts: opt(TRANSACTION_TYPES, e.type || 'out') })}
+          <div class="amount-entry">${field('amount', 'Số tiền (₫)', 'i-coins', { type: 'number', val: e.amount, attr: 'min="0.01" step="any" inputmode="decimal"' })}
+            <div class="amount-presets" role="group" aria-label="Mức tiền nhập nhanh"><span>Nhập nhanh</span><button type="button" class="sm" data-act="amountPreset" data-id="10000">10.000 ₫</button><button type="button" class="sm" data-act="amountPreset" data-id="100000">100.000 ₫</button></div></div>
+          <div id="txCategoryField"${transfer ? ' hidden' : ''}>${field('cat', 'Danh mục', 'i-layer-group', { tag: 'select', opts: catOpts(e.catId, 'Chọn danh mục', e.type || 'out', [editingCategory], formScope, formScope === 'family' ? formFamilyId : '') })}</div>
+          ${field('date', 'Ngày giao dịch', 's-cal', { type: 'date', val: editing ? e.date : today(), attr: `max="${today()}"` })}</div>
+        <div class="grid2 tx-transfer-fields" id="txTransferFields"${transfer ? '' : ' hidden'}>
+          ${field('fromAccount', 'Chuyển từ ví', 'i-wallet', { tag: 'select', opts: opt(accountOptions, e.accountId || (!editing && !copied ? myAccounts().find(a => a.type === 'cash')?.id : ''), 'Chọn ví nguồn') })}
+          ${field('toAccount', 'Chuyển đến ví', 'i-wallet', { tag: 'select', opts: opt(accountOptions, e.toAccountId, 'Chọn ví nhận') })}</div>
+        <div id="txRegularFields"${transfer ? ' hidden' : ''}>
+          ${field('account', 'Ví / Tài khoản', 'i-wallet', { tag: 'select', opts: opt(accountOptions, e.accountId || (!editing && !copied ? myAccounts().find(a => a.type === 'cash')?.id : ''), 'Chọn ví/tài khoản') })}
           ${field('payment', 'Phương thức thanh toán', 'i-wallet', { tag: 'select', opts: opt(PAYMENT_METHODS, e.paymentMethod, 'Chưa chọn') })}
-          <div class="family-scope-block"><label class="family-scope-radio"><input type="radio" name="scope" value="personal" ${(!e.scope || e.scope === 'personal') ? 'checked' : ''}> Cá nhân</label><label class="family-scope-radio"><input type="radio" name="scope" value="family" ${e.scope === 'family' ? 'checked' : ''}> Gia đình</label></div>
-          ${familyOptions.length ? `<div class="grid2">${field('familyId', 'Gia đình', 'i-users', { tag: 'select', opts: opt(familyOptions, e.familyId || activeFamilyId(), 'Chọn gia đình') })}${field('actor', 'Người thực hiện', 'i-user', { tag: 'select', opts: opt([[session.email, session.name]], e.owner || session.email, session.name) })}</div>` : ''}
-          ${field('note', 'Mô tả (tối đa 500 ký tự)', 'i-receipt', { tag: 'textarea', val: e.note, attr: 'maxlength="500"' })}
-          <div class="actions"><button type="button" class="btn-ghost-d" data-act="cancel">HỦY</button><button class="btn-primary">LƯU</button></div></form>`; };
+          <div class="tx-recurring-receipt-grid"><div>${field('recurrence', 'Giao dịch định kỳ', 's-refresh', { tag: 'select', opts: opt([['none', 'Không lặp'], ['monthly', 'Hàng tháng']], e.recurrence || 'none') })}
+            <small class="tx-field-hint">Lương, tiền điện, Internet, tiền thuê nhà…</small></div>
+            <div class="tx-receipt-control"><div class="field"><div class="input-wrap fl"><input id="receipt" name="receipt" type="file" accept="image/jpeg,image/png,image/gif,image/webp,image/heic,image/heif,application/pdf"><label for="receipt">Hóa đơn / chứng từ</label></div><div class="err-slot"><p class="error"><span></span></p></div></div><small>Ảnh hoặc PDF, tối đa 1 MB</small>
+              ${receiptData(e.receipt) ? `<a href="${esc(receiptData(e.receipt))}" target="_blank" rel="noopener" class="tx-receipt-existing">${esc(e.receipt.name || 'Chứng từ đính kèm')}</a><label class="tx-receipt-remove"><input type="checkbox" name="receiptRemove" value="yes"> Gỡ chứng từ hiện tại</label>` : ''}</div></div>
+        </div>
+        ${familyScopeControl}${familyField}<div id="txFamilySetupHint" class="family-form-hint et-family-prereq" hidden></div>${editing?.scope === 'family' ? `<p class="family-form-hint">Người tạo: <strong>${esc(uname(editing.owner))}</strong> · Thành viên đang sửa không làm thay đổi người tạo.</p>` : ''}
+        ${field('note', 'Mô tả / ghi chú', 'i-receipt', { tag: 'textarea', val: e.note, attr: 'maxlength="500"' })}
+        <div class="actions"><button type="button" class="btn-ghost-d" data-act="cancel">HỦY</button><button class="btn-primary">${editing ? 'LƯU THAY ĐỔI' : 'LƯU GIAO DỊCH'}</button></div></form>`;
+    };
   const PAGES = {
     user: {
       dash: { t: 'Dashboard', i: 'i-wallet', html: dashShell, dyn: userDash },
@@ -784,11 +1616,12 @@
         <div class="card"><div class="card-head"><h2 class="card-title">DANH SÁCH GIAO DỊCH</h2><div class="head-act">
           <button type="button" class="sm red" id="bulk" data-act="bulk" disabled>${ic('s-trash', 1)}Xóa đã chọn (0)</button>
           <button type="button" class="sm" data-act="resetFilter">${ic('s-refresh', 1)}ĐẶT LẠI LỌC</button><button type="button" class="sm" data-act="exportTx">${ic('s-download', 1)}XUẤT CSV</button></div></div>
-          <div class="toolbar tx-filters">${live('q', 'Tìm mô tả, danh mục, số tiền', 's-search', { val: S.q })}${live('ft', 'Lọc theo loại', 's-filter', { tag: 'select', opts: opt(TYPES, S.ft, 'Tất cả') })}${live('fc', 'Lọc theo danh mục', 'i-layer-group', { tag: 'select', opts: catOpts(S.fc, 'Tất cả') })}${live('fp', 'Phương thức thanh toán', 'i-wallet', { tag: 'select', opts: opt(PAYMENT_METHODS, S.fp, 'Tất cả') })}</div>
+          <div class="toolbar tx-filters">${live('q', 'Tìm tên, ghi chú, mô tả…', 's-search', { val: S.q })}${live('ft', 'Lọc theo loại', 's-filter', { tag: 'select', opts: opt(TRANSACTION_TYPES, S.ft, 'Tất cả') })}${live('fc', 'Lọc theo danh mục', 'i-layer-group', { tag: 'select', opts: catOpts(S.fc, 'Tất cả', undefined, [], S.scopeFilter && S.scopeFilter !== 'personal' ? 'family' : 'personal', S.scopeFilter || '') })}${live('fp', 'Phương thức thanh toán', 'i-wallet', { tag: 'select', opts: opt(PAYMENT_METHODS, S.fp, 'Tất cả') })}</div>
+          <div class="toolbar tx-filters">${live('fw', 'Ví / tài khoản', 'i-wallet', { tag: 'select', opts: opt(myAccounts().map(account => [account.id, account.name]), S.fw, 'Tất cả ví') })}${live('fmin', 'Số tiền từ (₫)', 'i-coins', { type: 'number', val: S.fmin, attr: 'min="0" step="any"' })}${live('fmax', 'Số tiền đến (₫)', 'i-coins', { type: 'number', val: S.fmax, attr: 'min="0" step="any"' })}${transactionMemberOptions().length ? live('fm', 'Thành viên', 'i-users', { tag: 'select', opts: opt(transactionMemberOptions(), S.fm, 'Tất cả thành viên') }) : ''}</div>
           <div class="toolbar tx-filters">${live('scopeFilter', 'Phạm vi', 'i-layer-group', { tag: 'select', opts: opt(familyScopeOptions(), S.scopeFilter || 'personal') })}</div>
           <div class="toolbar two">${live('fd', 'Từ ngày', 's-cal', { type: 'date', val: S.fd })}${live('td', 'Đến ngày', 's-cal', { type: 'date', val: S.td })}</div>
           <div id="txSummary">${txSummary()}</div>
-          ${table(['<input type="checkbox" class="chk" id="selAll" data-act="selAll" aria-label="Chọn tất cả">', 'STT', 'Loại', { l: 'Số tiền', k: 'amount' }, 'Danh mục', { l: 'Ngày', k: 'date' }, 'Tài khoản', 'Thanh toán', 'Mô tả', 'Thao tác'], 'rows')}</div>` },
+          ${table(['<input type="checkbox" class="chk" id="selAll" data-act="selAll" aria-label="Chọn tất cả">', 'STT', 'Loại', { l: 'Số tiền', k: 'amount' }, 'Danh mục / Ví nhận', { l: 'Ngày', k: 'date' }, 'Tài khoản', 'Thanh toán', 'Mô tả', 'Thao tác'], 'rows')}</div>` },
       family: { t: 'Gia đình', i: 'i-users', html: familyPage },
       moneyAccounts: { t: 'Ví / Tài khoản tiền', i: 'i-wallet', html: moneyAccountsPage },
       cats: { t: 'Danh mục', i: 'i-layer-group', rows: catRows, html: catPage },
@@ -808,10 +1641,12 @@
           <div class="card"><div class="card-head"><h2 class="card-title">DANH SÁCH NGƯỜI DÙNG</h2><button type="button" class="btn-primary" style="height:40px" data-act="addUser">${ic('s-plus', 1)}THÊM NGƯỜI DÙNG</button></div>${table(['STT', 'Họ tên', 'Email', 'Quyền', 'Trạng thái', 'Thao tác'], 'rows')}</div>` },
       cats: { t: 'Quản lý danh mục', i: 'i-layer-group', rows: catRows, html: catPage },
       tx: { t: 'Quản lý giao dịch', i: 'i-receipt', pg: true, rows: txRows, html: () => `<form class="card" data-f="noop" novalidate><h2 class="card-title">BỘ LỌC GIAO DỊCH</h2>
-          <div class="grid2">${live('au', 'Người dùng', 'i-users', { tag: 'select', opts: opt(db.users.map(u => [u.email, u.name]), S.au, 'Tất cả người dùng') })}${live('at', 'Loại', 's-swap', { tag: 'select', opts: opt(TYPES, S.at, 'Tất cả') })}
-          ${live('ac', 'Danh mục', 'i-layer-group', { tag: 'select', opts: catOpts(S.ac, 'Tất cả') })}<div class="grid2" style="gap:0 14px">${live('af', 'Từ ngày', 's-cal', { type: 'date', val: S.af })}${live('ae', 'Đến ngày', 's-cal', { type: 'date', val: S.ae })}</div></div>
+          <div class="grid2">${live('au', 'Người dùng', 'i-users', { tag: 'select', opts: opt(db.users.map(u => [u.email, u.name]), S.au, 'Tất cả người dùng') })}${live('at', 'Loại', 's-swap', { tag: 'select', opts: opt(TRANSACTION_TYPES, S.at, 'Tất cả') })}
+          ${live('ac', 'Danh mục', 'i-layer-group', { tag: 'select', opts: catOpts(S.ac, 'Tất cả', undefined, [], 'all') })}<div class="grid2" style="gap:0 14px">${live('af', 'Từ ngày', 's-cal', { type: 'date', val: S.af })}${live('ae', 'Đến ngày', 's-cal', { type: 'date', val: S.ae })}</div></div>
+          <div class="toolbar tx-filters">${live('fw', 'Ví / tài khoản', 'i-wallet', { tag: 'select', opts: opt(db.accounts.map(account => [account.id, `${account.name} · ${uname(account.owner)}`]), S.fw, 'Tất cả ví') })}${live('fmin', 'Số tiền từ (₫)', 'i-coins', { type: 'number', val: S.fmin, attr: 'min="0" step="any"' })}${live('fmax', 'Số tiền đến (₫)', 'i-coins', { type: 'number', val: S.fmax, attr: 'min="0" step="any"' })}</div>
           <div class="actions"><button type="button" class="btn-ghost-d" data-act="resetFilter">${ic('s-refresh', 1)}ĐẶT LẠI</button><button class="btn-primary">${ic('s-search', 1)}TÌM KIẾM</button></div></form>
-        <div class="card"><div class="card-head"><h2 class="card-title">KẾT QUẢ</h2><button type="button" class="sm" data-act="exportTx">${ic('s-download', 1)}XUẤT CSV</button></div>${table(['STT', 'Người dùng', 'Loại', { l: 'Số tiền', k: 'amount' }, 'Danh mục', { l: 'Ngày', k: 'date' }, 'Tài khoản', 'Thanh toán', 'Mô tả', 'Thao tác'], 'rows')}</div>` },
+        <div class="card"><div class="card-head"><h2 class="card-title">KẾT QUẢ</h2><button type="button" class="sm" data-act="exportTx">${ic('s-download', 1)}XUẤT CSV</button></div>${table(['STT', 'Người dùng', 'Loại', { l: 'Số tiền', k: 'amount' }, 'Danh mục / Ví nhận', { l: 'Ngày', k: 'date' }, 'Tài khoản', 'Thanh toán', 'Mô tả', 'Thao tác'], 'rows')}</div>` },
+      notifications: { t: 'Thông báo', i: 'i-envelope', html: notificationPage },
       report: { t: 'Báo cáo', i: 'i-chart-pie', html: reportPage },
       account: { t: 'Tài khoản', i: 'i-user', html: accountPage }
     }
@@ -821,18 +1656,26 @@
   let page = document.body.dataset.page || location.hash.slice(1); if (!PAGES[page]) page = 'dash';
   if (!isAdmin && page === 'dash' && !monthRe.test(S.dm || '')) S.dm = monthNow();
   $('#side').innerHTML = `<div class="brand"><span class="brand-mark">${ic('i-wallet')}</span>Expense Tracker</div><span class="role-tag">${isAdmin ? 'QUẢN TRỊ VIÊN' : 'NGƯỜI DÙNG'}</span>` +
-    Object.entries(PAGES).map(([k, p]) => `<button class="nav" data-p="${k}">${ic(p.i)}${p.t}</button>`).join('') +
+  Object.entries(PAGES).map(([k, p]) => `<button class="nav" data-p="${k}">${ic(p.i)}${p.t}${k === 'notifications' ? '<span class="notification-nav-count" aria-label="Thông báo chưa đọc"></span>' : ''}</button>`).join('') +
     `<button class="nav out" data-act="logout">${ic('i-arrow-right-to-bracket')}Đăng xuất</button>`;
   $('#uname').textContent = session.name;
   function render() {
     sync();
+    syncRecurringTransactions();
+    syncBudgetNotifications();
     const p = PAGES[page];
     $('#title').textContent = p.t; document.title = 'Expense Tracker — ' + p.t;
     document.querySelectorAll('.nav[data-p]').forEach(b => b.classList.toggle('on', b.dataset.p === page));
+    const navCount = $('.notification-nav-count');
+    if (navCount) {
+      const count = unreadNotificationCount();
+      navCount.textContent = count ? String(count) : '';
+      navCount.hidden = !count;
+    }
     $('#view').innerHTML = p.html(); refreshRows(); $('#side').classList.remove('open');
     if (!isAdmin) {   // nút nổi: thêm giao dịch nhanh
       if (!$('#fab')) document.body.insertAdjacentHTML('beforeend', `<button id="fab" class="btn-primary fab noprint" data-p="tx">${ic('s-plus', 1)}THÊM GIAO DỊCH</button>`);
-      $('#fab').style.display = page === 'tx' ? 'none' : '';
+      $('#fab').style.display = (page === 'tx' || (page === 'family' && (S.familyTab || 'overview') === 'members')) ? 'none' : '';
     }
   }
   function refreshRows() {
@@ -846,13 +1689,50 @@
     const n = (S.sel || []).length, bk = $('#bulk');
     if (bk) { bk.disabled = !n; bk.innerHTML = ic('s-trash', 1) + `Xóa đã chọn (${n})`; }
     const all = $('#selAll'); if (all) all.checked = !!PAGE_IDS.length && PAGE_IDS.every(id => (S.sel || []).includes(id));
+    const familyRows = $('#familyTxRows');
+    if (familyRows) {
+      const transactions = familyTransactionsFiltered(activeFamilyId());
+      familyRows.innerHTML = familyTxRowsHtml(transactions) || '<tr><td colspan="8" class="family-empty-cell">Không có giao dịch phù hợp</td></tr>';
+      const count = $('.family-filter-count'); if (count) count.textContent = `${transactions.length} giao dịch sau lọc`;
+      const summary = $('.family-filter-summary'); if (summary) summary.outerHTML = familyTxSummaryHtml(transactions);
+    }
   }
   const go = p => { page = p; Object.keys(S).forEach(k => delete S[k]); if (!isAdmin && p === 'dash') S.dm = monthNow(); history.replaceState(null, '', '#' + p); render(); };
   const setDm = v => { S.dm = v; const i = $('#dm'); if (i) i.value = v; refreshRows(); };
-  const FILTER_KEYS = ['q', 'ft', 'fc', 'fp', 'fd', 'td', 'au', 'at', 'ac', 'af', 'ae', 'uq', 'ur', 'us', 'pg', 'sel'];
+  const FILTER_KEYS = ['q', 'ft', 'fc', 'fp', 'fd', 'td', 'fw', 'fm', 'fmin', 'fmax', 'scopeFilter', 'au', 'at', 'ac', 'af', 'ae', 'uq', 'ur', 'us', 'pg', 'sel'];
 
   /* ===== Hành động ===== */
   const ACT = {
+    markNotificationRead: id => {
+      const notification = db.notifications.find(item => item.id === id && item.owner === session.email && !item.readAt);
+      if (!notification) return;
+      const previous = notification.readAt;
+      notification.readAt = new Date().toISOString();
+      try {
+        saveNotifications();
+      } catch (error) {
+        notification.readAt = previous;
+        console.error('Unable to mark notification as read', error);
+        toast('Không thể cập nhật trạng thái thông báo. Vui lòng thử lại.');
+        return;
+      }
+      render();
+    },
+    markAllNotificationsRead: () => {
+      const unread = notificationsForMe().filter(notification => !notification.readAt);
+      if (!unread.length) return;
+      const readAt = new Date().toISOString();
+      unread.forEach(notification => { notification.readAt = readAt; });
+      try {
+        saveNotifications();
+      } catch (error) {
+        unread.forEach(notification => { delete notification.readAt; });
+        console.error('Unable to mark notifications as read', error);
+        toast('Không thể cập nhật trạng thái thông báo. Vui lòng thử lại.');
+        return;
+      }
+      render(); toast(`Đã đánh dấu ${unread.length} thông báo là đã đọc`);
+    },
     pw: el => { const i = el.parentElement.querySelector('input'), s = i.type === 'password'; i.type = s ? 'text' : 'password'; el.firstElementChild.firstElementChild.setAttribute('href', s ? '#i-eye-slash' : '#i-eye'); },
     amountPreset: value => { const input = $('#amount'), amount = Number(value); if (!input || ![10000, 100000].includes(amount)) return; input.value = String(amount); input.dispatchEvent(new Event('input', { bubbles: true })); input.focus(); },
     cancel: () => { delete S.editTx; delete S.copyTx; delete S.editCat; render(); },
@@ -860,8 +1740,210 @@
     cancelGoal: () => { delete S.editGoal; render(); },
     addMoneyAccount: () => { S.showMoneyAccountForm = true; render(); scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' }); },
     cancelMoneyAccount: () => { delete S.showMoneyAccountForm; render(); },
+    cancelFamilyWalletSetup: () => {
+      const familyId = S.familyWalletSetup;
+      delete S.familyWalletSetup; delete S.showMoneyAccountForm;
+      if (familyId && familyMemberOf(familyId)) { S.familyId = familyId; page = 'family'; history.replaceState(null, '', '#family'); }
+      render();
+    },
+    toggleHiddenAccounts: () => { S.showHiddenAccounts = !S.showHiddenAccounts; render(); },
+    showAccountLedger: id => {
+      const account = db.accounts.find(item => item.id === id && accountCanUse(item));
+      if (!account) return toast('Không tìm thấy ví hoặc bạn không có quyền xem');
+      const events = accountLedger(account);
+      openDlg(`<h2 class="card-title">LỊCH SỬ SỐ DƯ · ${esc(account.name)}</h2><p class="money-account-intro">${accountIsFamily(account) ? 'Ví quỹ chung' : 'Ví cá nhân'} · Số dư hiện tại ${money(accountBalance(account))}</p>
+        <div class="money-ledger-list">${events.map(event => `<article class="money-ledger-item"><div><span class="money-ledger-kind ${esc(event.kind)}">${esc(event.kind === 'opening' ? 'Đầu kỳ' : event.kind === 'adjustment' ? 'Đối soát' : event.kind === 'transfer' ? 'Chuyển ví' : event.kind === 'in' ? 'Thu' : 'Chi')}</span><strong>${esc(event.label)}</strong><small>${event.kind === 'opening' ? 'Số dư khởi tạo' : esc(formatTimestamp(event.date))}</small></div><div><b class="${event.amount >= 0 ? 'inc' : 'exp'}">${event.amount > 0 ? '+' : ''}${money(event.amount)}</b><small>Sau giao dịch: ${money(event.balanceAfter)}</small></div></article>`).join('') || '<div class="chart-empty">Chưa có biến động số dư.</div>'}</div><div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">ĐÓNG</button></div>`, true);
+    },
+    reconcileAccount: id => {
+      const account = db.accounts.find(item => item.id === id && accountCanUse(item));
+      if (!account || (accountIsFamily(account) && !canManageFamily(account.familyId))) return toast('Bạn không có quyền đối soát ví này');
+      dform.onsubmit = e => {
+        if (e.submitter?.value !== 'ok') return;
+        e.preventDefault();
+        const data = Object.fromEntries(new FormData(dform));
+        const actual = Number(data.actualBalance);
+        const errors = {};
+        if (data.actualBalance == null || String(data.actualBalance).trim() === '' || !Number.isFinite(actual) || Math.abs(actual) > 999999999999) errors.actualBalance = 'Nhập số dư thực tế hợp lệ';
+        if ((data.reconcileNote || '').trim().length > 240) errors.reconcileNote = 'Ghi chú tối đa 240 ký tự';
+        if (!showErr(dform, errors)) return;
+        const delta = actual - accountBalance(account);
+        if (!delta) { dlg.close(); toast('Số dư đã khớp, không cần điều chỉnh'); return; }
+        const entry = { id: uid(), accountId: account.id, owner: session.email, delta, note: (data.reconcileNote || '').trim(), createdAt: new Date().toISOString() };
+        db.accountAdjustments.push(entry);
+        try {
+          saveAccountAdjustments();
+        } catch (error) {
+          db.accountAdjustments = db.accountAdjustments.filter(item => item.id !== entry.id);
+          console.error('Unable to save account reconciliation', error);
+          toast('Không thể lưu đối soát. Vui lòng kiểm tra dung lượng lưu trữ trình duyệt.', 4200);
+          return;
+        }
+        recordNotification(session.email, `account:reconciled:${entry.id}`, 'account', 'Đã đối soát số dư tài khoản',
+          `${account.name}: ${delta > 0 ? 'tăng' : 'giảm'} ${money(Math.abs(delta))}${entry.note ? ` · ${entry.note}` : ''}.`);
+        render(); dlg.close(); toast(`Đã đối soát số dư ${account.name}`);
+      };
+      openDlg(`<h2 class="card-title">ĐỐI SOÁT · ${esc(account.name)}</h2><div class="money-reconcile-current"><span>Số dư theo sổ</span><strong>${money(accountBalance(account))}</strong></div>${field('actualBalance', 'Số dư thực tế (₫)', 'i-coins', { type: 'number', val: accountBalance(account), attr: 'step="any"' })}${field('reconcileNote', 'Lý do / ghi chú', 'i-receipt', { tag: 'textarea', attr: 'maxlength="240"' })}<p class="family-form-hint">Hệ thống sẽ ghi nhận phần chênh lệch thành một bút toán đối soát, không sửa/xóa giao dịch cũ.</p><div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">HỦY</button><button class="btn-primary" value="ok">GHI ĐIỀU CHỈNH</button></div>`);
+    },
+    hideAccount: id => {
+      const account = db.accounts.find(item => item.id === id && accountCanUse(item));
+      if (!account || (accountIsFamily(account) && !canManageFamily(account.familyId))) return toast('Bạn không có quyền ẩn ví này');
+      confirmBox(`Ẩn ví "${account.name}"? Số dư và lịch sử vẫn được giữ nguyên.`, () => {
+        account.hidden = true; account.hiddenAt = new Date().toISOString();
+        try { saveAccounts(); } catch (error) {
+          account.hidden = false; delete account.hiddenAt;
+          console.error('Unable to hide account', error); toast('Không thể ẩn ví. Vui lòng thử lại.'); return;
+        }
+        render(); toast('Đã ẩn ví, dữ liệu lịch sử được giữ nguyên');
+      });
+    },
+    restoreAccount: id => {
+      const account = db.accounts.find(item => item.id === id && accountCanUse(item));
+      if (!account || (accountIsFamily(account) && !canManageFamily(account.familyId))) return toast('Bạn không có quyền khôi phục ví này');
+      account.hidden = false; delete account.hiddenAt;
+      try { saveAccounts(); } catch (error) {
+        account.hidden = true;
+        console.error('Unable to restore account', error); toast('Không thể hiện lại ví. Vui lòng thử lại.'); return;
+      }
+      render(); toast('Đã hiện lại ví');
+    },
     closeDlg: () => dlg.close(),
-    familyTab: id => { S.familyTab = id || 'overview'; render(); },
+    familyTab: id => { S.familyTab = id || 'overview'; if (id !== 'members') { delete S.familyProfileEmail; delete S.familyProfileTab; } render(); },
+    resetFamilyTxFilter: () => { delete S.familyTxSearch; delete S.familyTxMember; delete S.familyTxMonth; delete S.familyTxType; render(); },
+    toggleFamilyBudget: () => { S.editFamilyBudget = !S.editFamilyBudget; render(); },
+    editFamilyCategoryBudget: id => {
+      const entry = familyBudgets(activeFamilyId()).find(budget => budget.id === id);
+      if (!entry || !canManageFamily(entry.familyId)) return toast('Bạn không có quyền sửa hạn mức này');
+      S.editFamilyCategoryBudget = id; S.familyBudgetMonth = entry.month; render();
+    },
+    cancelFamilyCategoryBudget: () => { delete S.editFamilyCategoryBudget; render(); },
+    delFamilyCategoryBudget: id => {
+      const entry = familyBudgets(activeFamilyId()).find(budget => budget.id === id);
+      if (!entry || !canManageFamily(entry.familyId)) return toast('Bạn không có quyền xóa hạn mức này');
+      confirmBox('Xóa hạn mức danh mục này?', () => {
+        db.budgets = db.budgets.filter(budget => budget.id !== id);
+        saveBudgets(); delete S.editFamilyCategoryBudget; render(); toast('Đã xóa hạn mức danh mục');
+      });
+    },
+    acceptFamilyInvite: id => {
+      const invite = db.familyInvites.find(item => item.id === id && item.status === 'PENDING' && (item.email || '').toLowerCase() === session.email.toLowerCase());
+      const family = invite && familyOf(invite.familyId);
+      if (!invite || !family) return toast('Lời mời không hợp lệ hoặc đã hết hạn');
+      const existing = db.familyMembers.find(member => member.familyId === family.id && member.userEmail === session.email);
+      if (existing?.status === 'ACTIVE') return toast('Bạn đã là thành viên của gia đình này');
+      if (existing) {
+        existing.status = 'ACTIVE'; existing.role = 'MEMBER'; existing.relationship = invite.relationship || existing.relationship || ''; existing.joinedAt = new Date().toISOString();
+      } else {
+        db.familyMembers.push({ id: uid(), familyId: family.id, userEmail: session.email, relationship: invite.relationship || '', role: 'MEMBER', status: 'ACTIVE', joinedAt: new Date().toISOString() });
+      }
+      invite.status = 'ACCEPTED'; invite.respondedAt = new Date().toISOString();
+      S.familyId = family.id; S.familyTab = 'overview';
+      saveFamilyMembers(); saveFamilyInvites();
+      recordNotification(invite.inviterEmail, `family-invite:${invite.id}:accepted`, 'invite', 'Lời mời gia đình được chấp nhận',
+        `${findUser(session.email)?.name || session.email} đã tham gia gia đình ${family.name}.`, family.id);
+      render(); toast(`Bạn đã tham gia ${family.name}`);
+    },
+    rejectFamilyInvite: id => {
+      const invite = db.familyInvites.find(item => item.id === id && item.status === 'PENDING' && (item.email || '').toLowerCase() === session.email.toLowerCase());
+      if (!invite) return toast('Lời mời không hợp lệ hoặc đã hết hạn');
+      invite.status = 'REJECTED'; invite.respondedAt = new Date().toISOString();
+      saveFamilyInvites();
+      recordNotification(invite.inviterEmail, `family-invite:${invite.id}:rejected`, 'invite', 'Lời mời gia đình bị từ chối',
+        `${session.name} đã từ chối lời mời tham gia ${familyOf(invite.familyId)?.name || 'gia đình'}.`, invite.familyId);
+      render(); toast('Đã từ chối lời mời');
+    },
+    openFamilyProfile: id => {
+      const family = activeFamily();
+      if (!family || !familyMemberOf(family.id) || !familyMemberOf(family.id, id)) return toast('Không thể xem thành viên này');
+      S.familyTab = 'members'; S.familyProfileEmail = id; S.familyProfileTab = 'overview'; S.familyProfileMonth = monthNow();
+      render(); document.querySelector('.family-tabs')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    },
+    backFamilyMembers: () => { delete S.familyProfileEmail; delete S.familyProfileTab; delete S.familyProfileMonth; render(); },
+    familyProfileTab: id => {
+      if (!['overview', 'transactions', 'permissions', 'info'].includes(id)) return;
+      S.familyProfileTab = id; render();
+    },
+    familyProfileAll: () => { S.familyProfileMonth = 'all'; render(); },
+    editFamilyRelationship: id => {
+      const family = activeFamily();
+      const member = family && familyMemberOf(family.id, id);
+      if (!family || !member || !(canManageFamily(family.id) || id === session.email)) return toast('Bạn không có quyền sửa hồ sơ này');
+      dform.onsubmit = e => {
+        if (e.submitter?.value !== 'ok') return;
+        e.preventDefault();
+        const data = Object.fromEntries(new FormData(dform));
+        const relation = data.memberRelationship === 'none' ? '' : String(data.memberRelationship || '');
+        const note = String(data.memberFamilyNote || '').trim();
+        if (!FAMILY_RELATIONS.some(([value]) => value === relation)) return toast('Quan hệ không hợp lệ');
+        if (note.length > 240) return toast('Ghi chú tối đa 240 ký tự');
+        const original = { relationship: member.relationship, familyNote: member.familyNote };
+        member.relationship = relation; member.familyNote = note;
+        try { saveFamilyMembers(); } catch (error) {
+          member.relationship = original.relationship; member.familyNote = original.familyNote;
+          console.error('Lưu hồ sơ gia đình thất bại:', error); return toast('Không thể lưu. Hãy kiểm tra dung lượng lưu trữ.');
+        }
+        dlg.close(); render(); toast('Đã cập nhật hồ sơ thành viên ✨');
+      };
+      openDlg(`<div class="et-edit-modal"><div class="et-modal-emoji" aria-hidden="true">💖</div><h2>Chỉnh sửa hồ sơ gia đình</h2><p>👤 ${esc(findUser(id)?.name || id)}</p>${field('memberRelationship', 'Quan hệ trong gia đình', 'i-users', { tag: 'select', opts: opt(FAMILY_RELATIONS.map(([value, label]) => [value || 'none', label]), member.relationship || 'none') })}${field('memberFamilyNote', 'Ghi chú trong gia đình', 'i-receipt', { tag: 'textarea', val: member.familyNote || '', attr: 'maxlength="240"' })}<p class="et-profile-muted">🛡️ Quan hệ gia đình không tự động thay đổi quyền truy cập.</p><div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">Hủy</button><button type="submit" class="btn-primary" value="ok">💾 Lưu hồ sơ</button></div></div>`, true);
+    },
+    editFamilyRole: id => {
+      const family = activeFamily();
+      const member = family && familyMemberOf(family.id, id);
+      if (!family || !canManageFamilyRoles(family.id)) return toast('Chỉ chủ gia đình mới được phân quyền');
+      if (!member || member.role === 'OWNER' || member.userEmail === family.ownerEmail) return toast('Không thể thay đổi quyền chủ gia đình bằng biểu mẫu này');
+      dform.onsubmit = e => {
+        if (e.submitter?.value !== 'ok') return;
+        e.preventDefault();
+        const role = new FormData(dform).get('memberRole');
+        if (!['MEMBER', 'MANAGER'].includes(role)) return toast('Quyền được chọn không hợp lệ');
+        const original = member.role;
+        member.role = role;
+        try { saveFamilyMembers(); } catch (error) { member.role = original; console.error(error); return toast('Lưu phân quyền thất bại'); }
+        dlg.close(); render(); toast('Đã cập nhật quyền thành viên 🛡️');
+      };
+      openDlg(`<div class="et-edit-modal"><div class="et-modal-emoji" aria-hidden="true">🛡️</div><h2>Phân quyền thành viên</h2><p>${esc(findUser(id)?.name || id)}</p><div class="et-role-picker"><label><input type="radio" name="memberRole" value="MEMBER" ${member.role === 'MEMBER' ? 'checked' : ''}><span>🤝 <b>Thành viên</b><small>Xem & thêm giao dịch chung, sửa khoản của mình.</small></span></label><label><input type="radio" name="memberRole" value="MANAGER" ${member.role === 'MANAGER' ? 'checked' : ''}><span>🌟 <b>Quản lý tài chính</b><small>Duyệt thành viên, quản lý ngân sách và giao dịch chung.</small></span></label></div><p class="et-profile-muted">🔒 Chỉ chủ gia đình có thể thay đổi phân quyền; không ảnh hưởng tới quan hệ gia đình.</p><div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">Hủy</button><button type="submit" class="btn-primary" value="ok">Lưu quyền</button></div></div>`, true);
+    },
+    toggleFamilyManager: id => {
+      const family = activeFamily();
+      if (!family || !canManageFamilyRoles(family.id)) return toast('Chỉ chủ gia đình mới được phân quyền');
+      const member = db.familyMembers.find(item => item.familyId === family.id && item.userEmail === id && item.status === 'ACTIVE' && item.userEmail !== family.ownerEmail);
+      if (!member) return toast('Không tìm thấy thành viên hợp lệ');
+      member.role = member.role === 'MANAGER' ? 'MEMBER' : 'MANAGER';
+      saveFamilyMembers(); render(); toast(member.role === 'MANAGER' ? 'Đã bổ nhiệm người quản lý' : 'Đã đổi về vai trò thành viên');
+    },
+    addFamilyFundEntry: type => {
+      const family = activeFamily();
+      const entryType = type === 'use' ? 'use' : 'contribution';
+      if (!family || !familyMemberOf(family.id)) return toast('Bạn cần là thành viên đang hoạt động của gia đình');
+      if (entryType === 'use' && !canManageFamily(family.id)) return toast('Chỉ chủ gia đình hoặc người quản lý được ghi nhận sử dụng quỹ');
+      const title = entryType === 'use' ? 'Ghi nhận sử dụng quỹ' : 'Đóng góp vào quỹ chung';
+      dform.onsubmit = e => {
+        if (e.submitter?.value !== 'ok') return;
+        e.preventDefault();
+        const data = Object.fromEntries(new FormData(dform));
+        const amount = Number(data.fundAmount);
+        const errors = {};
+        if (data.fundAmount == null || String(data.fundAmount).trim() === '' || !Number.isFinite(amount) || amount <= 0) errors.fundAmount = 'Số tiền phải lớn hơn 0';
+        if ((data.fundNote || '').trim().length > 240) errors.fundNote = 'Ghi chú tối đa 240 ký tự';
+        if (!showErr(dform, errors)) return;
+        const entry = { id: uid(), familyId: family.id, owner: session.email, type: entryType, amount, note: (data.fundNote || '').trim(), date: today(), createdAt: new Date().toISOString() };
+        db.familyFundEntries.push(entry);
+        try {
+          saveFamilyFundEntries();
+        } catch (error) {
+          db.familyFundEntries = db.familyFundEntries.filter(item => item.id !== entry.id);
+          console.error('Unable to save family fund entry', error);
+          toast('Không thể lưu biến động quỹ. Vui lòng kiểm tra dung lượng lưu trữ trình duyệt.', 4200);
+          return;
+        }
+        const actor = findUser(session.email)?.name || session.email;
+        familyMembersOf(family.id).forEach(member => recordNotification(member.userEmail, `family-fund:${entry.id}`, 'fund',
+          entryType === 'contribution' ? 'Thành viên đóng góp quỹ chung' : 'Quỹ chung có khoản sử dụng',
+          `${actor} ${entryType === 'contribution' ? 'đã đóng góp' : 'đã ghi nhận sử dụng'} ${money(amount)}${entry.note ? ` · ${entry.note}` : ''}.`,
+          family.id));
+        S.familyTab = 'fund'; render(); dlg.close(); toast(entryType === 'use' ? 'Đã ghi nhận khoản sử dụng quỹ' : 'Đã ghi nhận khoản đóng góp');
+      };
+      openDlg(`<h2 class="card-title">${title}</h2>${field('fundAmount', 'Số tiền (₫)', 'i-coins', { type: 'number', val: '', attr: 'min="1" step="1000"' })}${field('fundNote', 'Nội dung', 'i-receipt', { tag: 'textarea', attr: 'maxlength="240"' })}<p class="family-form-hint">Thành viên: ${esc(findUser(session.email)?.name || session.email)} · ${fdate(today())}</p><div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">HỦY</button><button class="btn-primary" value="ok">Lưu vào sổ quỹ</button></div>`);
+    },
     createFamily: () => {
       dform.onsubmit = e => {
         if (e.submitter?.value !== 'ok') return;
@@ -895,7 +1977,7 @@
         const errors = {};
         if (!code) errors.famCode = 'Nhập mã gia đình';
         else if (!family) errors.famCode = 'Mã gia đình không tồn tại';
-        else if (db.familyMembers.some(member => member.familyId === family.id && member.userEmail === session.email && member.status !== 'REJECTED')) errors.famCode = 'Bạn đã có yêu cầu hoặc đã là thành viên của gia đình này';
+        else if (db.familyMembers.some(member => member.familyId === family.id && member.userEmail === session.email && ['ACTIVE', 'PENDING'].includes(member.status))) errors.famCode = 'Bạn đã có yêu cầu hoặc đã là thành viên của gia đình này';
         if (!showErr(dform, errors)) return;
         const member = { id: uid(), familyId: family.id, userEmail: session.email, role: 'MEMBER', status: 'PENDING', createdAt: new Date().toISOString() };
         db.familyMembers.push(member);
@@ -905,7 +1987,7 @@
     },
     inviteMember: () => {
       const family = activeFamily();
-      if (!family) return;
+      if (!family || !canManageFamily(family.id)) return toast('Bạn không có quyền mời thành viên');
       dform.onsubmit = e => {
         if (e.submitter?.value !== 'ok') return;
         e.preventDefault();
@@ -913,12 +1995,36 @@
         const email = (d.inviteEmail || '').trim().toLowerCase();
         const errors = {};
         if (!EMAIL_RE.test(email)) errors.inviteEmail = 'Email không hợp lệ';
-        else if (db.familyMembers.some(member => member.familyId === family.id && member.userEmail === email && member.status === 'ACTIVE')) errors.inviteEmail = 'Email này đã là thành viên';
+        else if (db.familyMembers.some(member => member.familyId === family.id && (member.userEmail || '').toLowerCase() === email && ['ACTIVE', 'PENDING'].includes(member.status))) errors.inviteEmail = 'Email này đã là thành viên hoặc có yêu cầu đang chờ';
+        else if (familyInvitesFor(family.id).some(invite => (invite.email || '').toLowerCase() === email)) errors.inviteEmail = 'Email này đã có lời mời đang chờ';
         if (!showErr(dform, errors)) return;
-        db.familyInvites.push({ id: uid(), familyId: family.id, inviterEmail: session.email, email, status: 'PENDING', createdAt: new Date().toISOString() });
-        saveFamilyInvites(); dlg.close(); render(); toast('Mời thành viên đã được gửi.');
+        const invite = { id: uid(), familyId: family.id, inviterEmail: session.email, email,
+          relationship: FAMILY_RELATIONS.some(([key]) => key === d.inviteRelationship) ? d.inviteRelationship : '',
+          status: 'PENDING', createdAt: new Date().toISOString() };
+        db.familyInvites.push(invite);
+        try {
+          saveFamilyInvites();
+        } catch (error) {
+          db.familyInvites = db.familyInvites.filter(item => item.id !== invite.id);
+          console.error('Unable to save family invitation', error);
+          toast('Không thể gửi lời mời. Vui lòng thử lại.');
+          return;
+        }
+        recordNotification(email, `family-invite:${invite.id}:received`, 'invite', 'Bạn được mời tham gia gia đình',
+          `${session.name} đã mời bạn tham gia ${family.name}.`, family.id);
+        recordNotification(session.email, `family-invite:${invite.id}:sent`, 'invite', 'Đã gửi lời mời gia đình',
+          `Lời mời tham gia ${family.name} đã được gửi đến ${email}.`, family.id);
+        dlg.close(); render(); toast('Mời thành viên đã được gửi.');
       };
-      openDlg(`<h2 style="color:var(--blue-900);margin-bottom:14px">Mời thành viên</h2>${field('inviteEmail', 'Email', 'i-envelope', { type: 'email' })}<div class="family-code-row"><label>Mã gia đình</label><div class="family-code-box">${esc(family.code || 'FAM-000000')}</div><button type="button" class="btn-ghost-d" data-act="copyFamilyCode">Sao chép mã</button></div><div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">HỦY</button><button class="btn-primary" value="ok">Gửi lời mời</button></div>`);
+      openDlg(`<h2 style="color:var(--blue-900);margin-bottom:14px">Mời thành viên</h2>${field('inviteEmail', 'Email', 'i-envelope', { type: 'email' })}${field('inviteRelationship', 'Quan hệ với gia đình', 'i-users', { tag: 'select', opts: opt(FAMILY_RELATIONS.filter(([key]) => key).map(([key, label]) => [key, label]), '', 'Cập nhật sau khi tham gia') })}<div class="family-code-row"><label>Mã gia đình</label><div class="family-code-box">${esc(family.code || 'FAM-000000')}</div><button type="button" class="btn-ghost-d" data-act="copyFamilyCode">Sao chép mã</button></div><div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">HỦY</button><button class="btn-primary" value="ok">Gửi lời mời</button></div>`);
+    },
+    cancelFamilyInvite: id => {
+      const family = activeFamily(), invite = db.familyInvites.find(item => item.id === id && item.familyId === family?.id && item.status === 'PENDING');
+      if (!family || !canManageFamily(family.id) || !invite) return;
+      confirmBox(`Hủy lời mời gửi đến ${invite.email}?`, () => {
+        invite.status = 'CANCELLED'; invite.respondedAt = new Date().toISOString();
+        saveFamilyInvites(); render(); toast('Đã hủy lời mời');
+      });
     },
     copyFamilyCode: () => {
       const family = activeFamily();
@@ -926,72 +2032,185 @@
       if (navigator.clipboard) navigator.clipboard.writeText(family.code || '').then(() => toast('Mã gia đình đã được sao chép')).catch(() => toast('Không thể sao chép mã gia đình'));
       else toast('Mã gia đình: ' + family.code);
     },
+    exportFamilyTx: () => {
+      const transactions = familyTransactionsFiltered(activeFamilyId());
+      if (!transactions.length) return toast('Không có giao dịch phù hợp để xuất');
+      download(`giao-dich-gia-dinh-${today()}.csv`, [
+        ['Ngày', 'Loại', 'Số tiền', 'Danh mục', 'Thành viên', 'Ví / Tài khoản', 'Phương thức thanh toán', 'Mô tả'],
+        ...transactions.map(tx => [fdate(tx.date), tx.type === 'transfer' ? 'Chuyển ví nội bộ' : tx.type === 'in' ? 'Thu' : 'Chi', tx.amount, tx.type === 'transfer' ? `${accountLabel(tx.accountId)} → ${accountLabel(tx.toAccountId)}` : cname(tx), uname(tx.owner), accountLabel(tx.accountId || tx.account), paymentLabel(tx.paymentMethod), tx.note || ''])
+      ]);
+    },
     addFamilyTransaction: () => {
       const family = activeFamily();
-      if (!family) return;
+      if (!family || !db.familyMembers.some(member => member.familyId === family.id && member.userEmail === session.email && member.status === 'ACTIVE')) return toast('Bạn cần là thành viên đang hoạt động của gia đình');
+      const accounts = familyAccounts(family.id);
+      if (!accounts.length) {
+        if (!canManageFamily(family.id)) return toast('Gia đình chưa có ví quỹ chung. Hãy nhờ chủ gia đình hoặc người quản lý tạo ví trước.');
+        S.familyWalletSetup = family.id; S.showMoneyAccountForm = true; page = 'moneyAccounts'; history.replaceState(null, '', '#moneyAccounts'); render();
+        return toast('Tạo ví quỹ chung để bắt đầu ghi giao dịch gia đình');
+      }
       dform.dataset.f = 'tx'; dform.onsubmit = null; dform.innerHTML = `<h2 class="card-title">THÊM GIAO DỊCH GIA ĐÌNH</h2>
         <div class="grid2">${field('type', 'Loại', 's-swap', { tag: 'select', opts: opt(TYPES, 'out') })}${field('amount', 'Số tiền', 'i-coins', { type: 'number', val: 0, attr: 'min="1000" step="1000"' })}
-        ${field('cat', 'Danh mục', 'i-layer-group', { tag: 'select', opts: catOpts('', 'Chọn danh mục', 'out') })}${field('date', 'Ngày', 's-cal', { type: 'date', val: today(), attr: `max="${today()}"` })}</div>
-        ${field('account', 'Ví/Tài khoản', 'i-wallet', { tag: 'select', opts: opt(myAccounts().map(a => [a.id, a.name]), myAccounts().find(a => a.type === 'cash')?.id || '', 'Chọn ví/tài khoản') })}
+        ${field('cat', 'Danh mục', 'i-layer-group', { tag: 'select', opts: catOpts('', 'Chọn danh mục', 'out', [], 'family', family.id) })}${field('date', 'Ngày', 's-cal', { type: 'date', val: today(), attr: `max="${today()}"` })}</div>
+        ${field('account', 'Ví quỹ chung', 'i-wallet', { tag: 'select', opts: opt(accounts.map(a => [a.id, a.name]), '', 'Chọn ví quỹ') })}
         ${field('payment', 'Phương thức thanh toán', 'i-wallet', { tag: 'select', opts: opt(PAYMENT_METHODS, 'cash', 'Chưa chọn') })}
         ${field('familyId', 'Gia đình', 'i-users', { tag: 'select', opts: opt([[family.id, family.name]], family.id) })}
-        ${field('actor', 'Người thực hiện', 'i-user', { tag: 'select', opts: opt(familyMembersOf(family.id).map(member => [member.userEmail, findUser(member.userEmail)?.name || member.userEmail]), session.email) })}
+        <p class="family-form-hint">📂 Bạn có thể chọn danh mục chung (mặc định) hoặc danh mục riêng do chủ gia đình/quản lý tạo. <strong>Giao dịch dùng chung</strong> sẽ hiển thị cho thành viên ACTIVE của gia đình này. Khoản cá nhân không xuất hiện trong thống kê gia đình. Người thực hiện: <strong>${esc(findUser(session.email)?.name || session.email)}</strong>.</p>
         ${field('note', 'Ghi chú', 'i-receipt', { tag: 'textarea', attr: 'maxlength="500"' })}
         <div class="field" style="display:none"><input id="scope" name="scope" value="family"></div>
         <div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">HỦY</button><button class="btn-primary" type="submit">LƯU</button></div>`; if (!dlg.open) dlg.showModal();
     },
-    acceptFamilyMember: id => { const member = db.familyMembers.find(m => m.userEmail === id && m.status === 'PENDING' && m.familyId === activeFamilyId()); if (!member) return; member.status = 'ACTIVE'; saveFamilyMembers(); render(); toast('Đã chấp nhận thành viên'); },
-    rejectFamilyMember: id => { const member = db.familyMembers.find(m => m.userEmail === id && m.status === 'PENDING' && m.familyId === activeFamilyId()); if (!member) return; member.status = 'REJECTED'; saveFamilyMembers(); render(); toast('Đã từ chối yêu cầu'); },
-    removeFamilyMember: id => { const family = activeFamily(); if (!family || family.ownerEmail !== session.email) return; const member = db.familyMembers.find(m => m.userEmail === id && m.familyId === family.id && m.status === 'ACTIVE'); if (!member || id === session.email) return toast('Không thể xóa chủ gia đình hoặc thành viên không hợp lệ');
-      confirmBox('Xóa thành viên khỏi gia đình?', () => { db.familyMembers = db.familyMembers.filter(m => !(m.familyId === family.id && m.userEmail === id)); saveFamilyMembers(); render(); toast('Đã xóa thành viên'); }); },
-    deleteFamily: () => { const family = activeFamily(); if (!family || family.ownerEmail !== session.email) return; confirmBox('Bạn có chắc muốn giải tán gia đình?', () => { db.families = db.families.filter(f => f.id !== family.id); db.familyMembers = db.familyMembers.filter(m => m.familyId !== family.id); db.familyInvites = db.familyInvites.filter(i => i.familyId !== family.id); db.tx = db.tx.filter(t => t.scope !== 'family' || t.familyId !== family.id); saveFamilies(); saveFamilyMembers(); saveFamilyInvites(); saveTx(); render(); toast('Gia đình đã được giải tán'); }); },
+    acceptFamilyMember: id => { const family = activeFamily(); const member = db.familyMembers.find(m => m.userEmail === id && m.status === 'PENDING' && m.familyId === family?.id); if (!family || !canManageFamily(family.id)) return toast('Bạn không có quyền duyệt thành viên'); if (!member) return toast('Yêu cầu không còn hợp lệ'); member.status = 'ACTIVE'; member.role = 'MEMBER'; member.joinedAt = new Date().toISOString(); saveFamilyMembers(); render(); toast('Đã chấp nhận thành viên'); },
+    rejectFamilyMember: id => { const family = activeFamily(); const member = db.familyMembers.find(m => m.userEmail === id && m.status === 'PENDING' && m.familyId === family?.id); if (!family || !canManageFamily(family.id)) return toast('Bạn không có quyền duyệt thành viên'); if (!member) return toast('Yêu cầu không còn hợp lệ'); member.status = 'REJECTED'; saveFamilyMembers(); render(); toast('Đã từ chối yêu cầu'); },
+    removeFamilyMember: id => { const family = activeFamily(); if (!family || !canManageFamily(family.id)) return toast('Bạn không có quyền xóa thành viên'); const member = db.familyMembers.find(m => m.userEmail === id && m.familyId === family.id && m.status === 'ACTIVE'); if (!member || id === session.email || (member.role !== 'MEMBER' && family.ownerEmail !== session.email)) return toast('Không thể xóa chủ gia đình hoặc thành viên có vai trò cao hơn');
+      confirmBox('Loại thành viên khỏi gia đình? Tài khoản và các giao dịch chung cũ sẽ được giữ nguyên.', () => { member.status = 'REMOVED'; member.removedAt = new Date().toISOString(); saveFamilyMembers(); if (S.familyProfileEmail === id) delete S.familyProfileEmail; render(); toast('Đã loại thành viên, dữ liệu chung được giữ lại'); }); },
+    deleteFamily: () => { const family = activeFamily(); if (!family || family.ownerEmail !== session.email) return; confirmBox('Bạn có chắc muốn giải tán gia đình?', () => { db.families = db.families.filter(f => f.id !== family.id); db.budgets = db.budgets.filter(budget => budget.scope !== 'family' || budget.familyId !== family.id); db.familyMembers = db.familyMembers.filter(m => m.familyId !== family.id); db.familyInvites = db.familyInvites.filter(i => i.familyId !== family.id); db.familyFundEntries = db.familyFundEntries.filter(entry => entry.familyId !== family.id); db.accounts = db.accounts.filter(account => !accountIsFamily(account) || account.familyId !== family.id); db.accountAdjustments = db.accountAdjustments.filter(entry => db.accounts.some(account => account.id === entry.accountId)); db.tx = db.tx.filter(t => t.scope !== 'family' || t.familyId !== family.id); saveFamilies(); saveBudgets(); saveFamilyMembers(); saveFamilyInvites(); saveFamilyFundEntries(); saveAccounts(); saveAccountAdjustments(); saveTx(); render(); toast('Gia đình đã được giải tán'); }); },
     /* --- Giao dịch --- */
-    editTx: id => { const t = db.tx.find(x => x.id === id); if (!t || t.owner !== session.email) return; delete S.copyTx; S.editTx = id; render(); scrollTo({ top: 0, behavior: 'smooth' }); },
+    editTx: id => { const t = db.tx.find(x => x.id === id); if (!t || !canEditFamilyTransaction(t)) return toast('Bạn không có quyền chỉnh sửa giao dịch này'); delete S.copyTx; S.editTx = id; page = 'tx'; history.replaceState(null, '', '#tx'); render(); scrollTo({ top: 0, behavior: 'smooth' }); },
     copyTx: id => { const t = db.tx.find(x => x.id === id); if (!t || t.owner !== session.email) return; delete S.editTx; S.copyTx = id; render(); scrollTo({ top: 0, behavior: 'smooth' }); toast('Đã sao chép vào biểu mẫu; kiểm tra rồi lưu'); },
-    viewTx: id => { const t = db.tx.find(x => x.id === id); if (!t || (!isAdmin && t.owner !== session.email)) return;
+    viewTx: id => { const t = db.tx.find(x => x.id === id); if (!t || !canViewTransaction(t)) return;
+      const receiptHref = receiptData(t.receipt);
       openDlg(`<h2 class="card-title">CHI TIẾT GIAO DỊCH</h2><dl class="tx-detail">
-        <div><dt>Loại</dt><dd><span class="badge ${t.type}">${t.type === 'in' ? 'Thu' : 'Chi'}</span></dd></div><div><dt>Số tiền</dt><dd class="${t.type === 'in' ? 'inc' : 'exp'}">${money(t.amount)}</dd></div>
-        <div><dt>Danh mục</dt><dd>${esc(cname(t))}</dd></div><div><dt>Ngày</dt><dd>${fdate(t.date)}</dd></div><div><dt>Ví / Tài khoản</dt><dd>${esc(accountLabel(t.accountId || t.account))}</dd></div><div><dt>Phương thức thanh toán</dt><dd>${esc(paymentLabel(t.paymentMethod))}</dd></div>
-        <div><dt>Mô tả</dt><dd>${esc(t.note) || '—'}</dd></div><div><dt>Tạo lúc</dt><dd>${formatTimestamp(t.createdAt)}</dd></div><div><dt>Cập nhật</dt><dd>${formatTimestamp(t.updatedAt || t.createdAt)}</dd></div>
-        </dl><div class="actions">${!isAdmin ? `<button type="button" class="sm" data-act="editTxDetail" data-id="${esc(t.id)}">${ic('i-pen-to-square')}Sửa</button>` : ''}<button type="button" class="btn-ghost-d" data-act="closeDlg">ĐÓNG</button></div>`, true); },
+        <div><dt>Loại</dt><dd><span class="badge ${t.type}">${t.type === 'in' ? 'Thu nhập' : t.type === 'out' ? 'Chi tiêu' : 'Chuyển ví nội bộ'}</span></dd></div><div><dt>Số tiền</dt><dd class="${t.type === 'in' ? 'inc' : t.type === 'out' ? 'exp' : ''}">${money(t.amount)}</dd></div>
+        <div><dt>${t.type === 'transfer' ? 'Ví nhận' : 'Danh mục'}</dt><dd>${t.type === 'transfer' ? esc(accountLabel(t.toAccountId)) : esc(cname(t))}</dd></div><div><dt>Ngày</dt><dd>${fdate(t.date)}</dd></div><div><dt>Ví / Tài khoản</dt><dd>${esc(accountLabel(t.accountId || t.account))}</dd></div><div><dt>Phương thức thanh toán</dt><dd>${esc(paymentLabel(t.paymentMethod))}</dd></div>
+        <div><dt>Phạm vi</dt><dd>${t.scope === 'family' ? `Dùng chung · ${esc(familyOf(t.familyId)?.name || 'Gia đình')}` : 'Cá nhân'}</dd></div><div><dt>Mô tả</dt><dd>${esc(t.note) || '—'}</dd></div><div><dt>Lặp lại</dt><dd>${t.recurrence === 'monthly' ? 'Hàng tháng' : t.recurringSource ? `Giao dịch định kỳ · ${esc(t.recurrencePeriod || '')}` : 'Không'}</dd></div>
+        <div><dt>Chứng từ</dt><dd>${receiptHref ? `<a href="${esc(receiptHref)}" download="${esc(t.receipt.name || 'chung-tu')}">${esc(t.receipt.name || 'Xem / tải chứng từ')}</a>` : '—'}</dd></div>
+        <div><dt>Tạo lúc</dt><dd>${formatTimestamp(t.createdAt)}</dd></div><div><dt>Cập nhật</dt><dd>${formatTimestamp(t.updatedAt || t.createdAt)}</dd></div>
+        </dl><div class="actions">${!isAdmin && canEditFamilyTransaction(t) ? `<button type="button" class="sm" data-act="editTxDetail" data-id="${esc(t.id)}">${ic('i-pen-to-square')}Sửa</button>` : ''}<button type="button" class="btn-ghost-d" data-act="closeDlg">ĐÓNG</button></div>`, true); },
     editTxDetail: id => { dlg.close(); ACT.editTx(id); },
-    delTx: id => { const t = db.tx.find(x => x.id === id); if (!t || (!isAdmin && t.owner !== session.email)) return;
-      confirmDeleteTx(t, () => { db.tx = db.tx.filter(x => x.id !== id); saveTx(); refreshRows(); toast('Đã xóa giao dịch'); }); },   // TODO: DELETE /api/transactions/:id
+    delTx: id => { const t = db.tx.find(x => x.id === id); if (!t || (!isAdmin && !canDeleteFamilyTransaction(t))) return toast('Bạn không có quyền xóa giao dịch này');
+      confirmDeleteTx(t, () => deleteTransactionsWithUndo([t])); },   // TODO: DELETE /api/transactions/:id
     selTx: id => { const s = S.sel = S.sel || []; const i = s.indexOf(id); i < 0 ? s.push(id) : s.splice(i, 1); refreshRows(); },
     selAll: () => { const s = S.sel = S.sel || [], every = PAGE_IDS.every(id => s.includes(id)); S.sel = every ? s.filter(id => !PAGE_IDS.includes(id)) : [...new Set([...s, ...PAGE_IDS])]; refreshRows(); },
-    bulk: () => { const ids = (S.sel || []).filter(id => db.tx.some(t => t.id === id && t.owner === session.email)); if (!ids.length) return;
-      confirmBox(`Xóa ${ids.length} giao dịch đã chọn?`, () => { db.tx = db.tx.filter(t => !ids.includes(t.id)); saveTx(); S.sel = []; refreshRows(); toast('Đã xóa ' + ids.length + ' giao dịch'); }); },
+    bulk: () => { const selected = (S.sel || []).map(id => db.tx.find(transaction => transaction.id === id && transaction.owner === session.email)).filter(Boolean); if (!selected.length) return;
+      confirmBox(`Xóa ${selected.length} giao dịch đã chọn?`, () => { S.sel = []; deleteTransactionsWithUndo(selected); }); },
     sort: k => { const cur = S.sk || 'date', dir = S.sd || 'desc'; S.sd = k === cur ? (dir === 'desc' ? 'asc' : 'desc') : 'desc'; S.sk = k; S.pg = 1;
       document.querySelectorAll('th[data-act="sort"]').forEach(th => { th.textContent = th.dataset.l + arrow(th.dataset.id); }); refreshRows(); },
     pg: n => { S.pg = Math.max(1, Math.min(PG.pages, Number(n))); refreshRows(); },
     resetFilter: () => { FILTER_KEYS.forEach(k => delete S[k]); render(); },
     exportTx: () => { const l = filterTx(); if (!l.length) return toast('Chưa có dữ liệu để xuất'); download(`giao-dich-${today()}.csv`, txCsv(l)); },
     /* --- Danh mục --- */
-    editCat: id => { const c = catOf(id); if (!c || !canEditCat(c)) return; S.editCat = id; render(); scrollTo({ top: 0, behavior: 'smooth' }); },
-    delCat: id => { const c = catOf(id); if (!c || !canDelCat(c)) return;
-      if (db.tx.some(t => t.catId === id)) return toast('Không thể xóa: danh mục đang có giao dịch', 3200);   // DB: ON DELETE RESTRICT
-      confirmBox('Xóa danh mục này?', () => { db.cats = db.cats.filter(x => x.id !== id); saveCats(); refreshRows(); toast('Đã xóa danh mục'); }); },   // TODO: DELETE /api/categories/:id
+    editCat: id => { const category = catOf(id); if (!category || !canEditCat(category)) return; S.editCat = id; S.catScope = categoryScopeOf(category); render(); scrollTo({ top: 0, behavior: 'smooth' }); },
+    hideCat: id => {
+      const category = catOf(id);
+      if (!category || !canEditCat(category)) return toast('Bạn không có quyền ẩn danh mục này');
+      if (db.cats.some(child => child.parentId === id && !child.hidden)) return toast('Hãy ẩn các danh mục con trước khi ẩn danh mục cha');
+      category.hidden = true;
+      try { saveCats(); } catch (error) {
+        delete category.hidden;
+        console.error('Unable to hide category', error);
+        return toast('Không thể ẩn danh mục. Vui lòng thử lại.');
+      }
+      render(); toast('Đã ẩn danh mục. Lịch sử giao dịch vẫn được giữ nguyên');
+    },
+    showCat: id => {
+      const category = catOf(id);
+      if (!category || !canEditCat(category)) return toast('Bạn không có quyền hiện danh mục này');
+      const parent = category.parentId && catOf(category.parentId);
+      if (parent?.hidden) return toast('Hãy hiện danh mục cha trước');
+      category.hidden = false;
+      try { saveCats(); } catch (error) {
+        category.hidden = true;
+        console.error('Unable to restore category', error);
+        return toast('Không thể hiện danh mục. Vui lòng thử lại.');
+      }
+      render(); toast('Đã hiện lại danh mục');
+    },
+    delCat: id => {
+      const category = catOf(id);
+      if (!category || !canDelCat(category)) return toast('Bạn không có quyền xóa danh mục này');
+      if (db.tx.some(transaction => transaction.catId === id)) return toast('Không thể xóa danh mục đang có giao dịch. Hãy ẩn danh mục để giữ lịch sử.');
+      if (db.cats.some(child => child.parentId === id)) return toast('Không thể xóa danh mục đang có danh mục con. Hãy xử lý các mục con trước.');
+      confirmBox(`Xóa danh mục "${category.name}"?`, () => {
+        const previous = db.cats;
+        db.cats = db.cats.filter(item => item.id !== id);
+        try { saveCats(); } catch (error) {
+          db.cats = previous;
+          console.error('Unable to delete category', error);
+          toast('Không thể xóa danh mục. Vui lòng thử lại.');
+          return;
+        }
+        render(); toast('Đã xóa danh mục');
+      });
+    },
     /* --- Dashboard --- */
     dm: id => setDm(id === 'all' ? '' : id === 'now' ? today().slice(0, 7) : shiftMonth(monthRe.test(S.dm || '') ? S.dm : today().slice(0, 7), Number(id))),
     refreshDash: () => { sync(); render(); toast('Đã làm mới dữ liệu từ thiết bị'); },
     editBudget: id => { if (!myBudgets().some(b => b.id === id)) return; S.editBudget = id; render(); scrollTo({ top: 0, behavior: 'smooth' }); },
     delBudget: id => { if (!myBudgets().some(b => b.id === id)) return; confirmBox('Xóa ngân sách này?', () => { db.budgets = db.budgets.filter(b => b.id !== id); saveBudgets(); delete S.editBudget; render(); toast('Đã xóa ngân sách'); }); },
     editGoal: id => { if (!myGoals().some(g => g.id === id)) return; S.editGoal = id; render(); scrollTo({ top: 0, behavior: 'smooth' }); },
-    delGoal: id => { if (!myGoals().some(g => g.id === id)) return; confirmBox('Xóa mục tiêu tiết kiệm này?', () => { db.goals = db.goals.filter(g => g.id !== id); saveGoals(); delete S.editGoal; render(); toast('Đã xóa mục tiêu'); }); },
+    contributeGoal: id => ACT.goalMovement(id, 'deposit'),
+    withdrawGoal: id => ACT.goalMovement(id, 'withdraw'),
+    goalMovement: (id, type) => {
+      const goal = myGoals().find(item => item.id === id);
+      if (!goal) return toast('Không tìm thấy mục tiêu tiết kiệm');
+      if (!ensureGoalAccount(goal)) return;
+      const accounts = myAccounts();
+      if (!accounts.length) return toast('Bạn cần có ít nhất một ví cá nhân để đóng góp hoặc rút tiền');
+      dform.dataset.f = 'goalMovement'; dform.onsubmit = null;
+      dform.innerHTML = `<h2 class="card-title">${type === 'deposit' ? 'ĐÓNG GÓP VÀO MỤC TIÊU' : 'RÚT TIỀN TỪ MỤC TIÊU'}</h2>
+        <p class="goal-movement-balance"><strong>${esc(goal.name)}</strong><span>Số dư hiện tại: ${money(goalSaved(goal))}</span></p>
+        ${field('goalMovementAmount', 'Số tiền (₫)', 'i-coins', { type: 'number', attr: 'min="0.01" step="any"' })}
+        ${field('goalMovementAccount', type === 'deposit' ? 'Chuyển từ ví' : 'Chuyển vào ví', 'i-wallet', { tag: 'select', opts: opt(accounts.map(account => [account.id, account.name]), '', 'Chọn ví cá nhân') })}
+        ${field('goalMovementNote', 'Ghi chú', 'i-receipt', { tag: 'textarea', attr: 'maxlength="240"' })}
+        <input type="hidden" name="goalMovementType" value="${type}"><input type="hidden" name="goalMovementGoalId" value="${esc(goal.id)}">
+        <div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">HỦY</button><button class="btn-primary">${type === 'deposit' ? 'ĐÓNG GÓP' : 'RÚT TIỀN'}</button></div>`;
+      if (!dlg.open) dlg.showModal();
+    },
+    delGoal: id => {
+      const goal = myGoals().find(item => item.id === id);
+      if (!goal) return;
+      if (goalMovements(goal).length) return toast('Không thể xóa mục tiêu đã có giao dịch đóng góp/rút tiền để bảo toàn lịch sử ví. Bạn có thể giữ mục tiêu làm lịch sử tiết kiệm.');
+      confirmBox('Xóa mục tiêu tiết kiệm này?', () => {
+        const previousGoals = db.goals.map(item => ({ ...item })), previousAccounts = db.accounts.map(item => ({ ...item }));
+        db.goals = db.goals.filter(item => item.id !== id);
+        db.accounts = db.accounts.filter(account => account.id !== goal.accountId || account.goalId !== goal.id);
+        try {
+          saveGoals(); saveAccounts();
+        } catch (error) {
+          db.goals = previousGoals; db.accounts = previousAccounts;
+          console.error('Unable to delete savings goal', error);
+          toast('Không thể xóa mục tiêu. Vui lòng thử lại.', 3600);
+          return;
+        }
+        delete S.editGoal; render(); toast('Đã xóa mục tiêu');
+      });
+    },
     /* --- Báo cáo --- */
-    repRange: id => { const t = today(), y = t.slice(0, 4), m = t.slice(5, 7), last = String(new Date(+y, +m, 0).getDate()).padStart(2, '0');
-      const r = id === 'month' ? [`${y}-${m}-01`, `${y}-${m}-${last}`] : id === 'year' ? [`${y}-01-01`, `${y}-12-31`] : ['', ''];
-      const f = $('[data-f="report"]'), el = f.elements; el.rf.value = r[0]; el.rt.value = r[1]; if (id === 'reset') { el.rc.value = ''; (el.ru || el.rty).value = ''; }
-      FORM.report(f, Object.fromEntries(new FormData(f))); },
+    repRange: id => {
+      const form = $('[data-f="report"]');
+      if (!form) return;
+      const period = id === 'reset' ? 'month' : id;
+      if (!REPORT_PERIODS.some(([key]) => key === period)) return;
+      const [start, end] = reportRange(period);
+      form.elements.rperiod.value = period;
+      form.elements.rf.value = start; form.elements.rt.value = end;
+      if (id === 'reset') {
+        form.elements.raccount.value = ''; form.elements.rc.value = '';
+        ['rmember', 'ru', 'rty'].forEach(name => { if (form.elements.namedItem(name)) form.elements.namedItem(name).value = ''; });
+      }
+      FORM.report(form, Object.fromEntries(new FormData(form)));
+    },
     rv: id => { S.rv = id; if (S.rrun) $('#repOut').innerHTML = reportOut(); },
-    exportRep: () => { const l = reportList(); if (!S.rrun || !l.length) return toast('Hãy bấm XEM BÁO CÁO để có dữ liệu trước khi xuất'); download(`bao-cao-${today()}.csv`, txCsv(l)); },
+    exportRep: (format = 'csv') => {
+      if (!S.rrun) return toast('Hãy tạo báo cáo trước khi xuất');
+      const rows = reportExportRows(reportList());
+      const scope = (S.reportScope || 'personal').replace(/[^\w-]/g, '-');
+      if (format === 'xls') downloadExcel(`bao-cao-${scope}-${today()}.xls`, rows);
+      else download(`bao-cao-${scope}-${today()}.csv`, rows);
+    },
     printRep: () => { if (!S.rrun) return toast('Hãy bấm XEM BÁO CÁO trước khi in'); window.print(); },
     /* --- Người dùng (admin) --- */
     lock: id => { const u = findUser(id); if (!u) return; if (id === session.email) return toast('Bạn không thể khóa chính mình');
-      u.status = locked(u) ? 'ACTIVE' : 'LOCKED'; saveUsers(); refreshRows(); toast(locked(u) ? 'Đã khóa tài khoản' : 'Đã mở khóa'); },   // TODO: PATCH /api/users/:id/lock
+      u.status = locked(u) ? 'ACTIVE' : 'LOCKED'; saveUsers();
+      recordNotification(id, `account:status:${u.status}:${uid()}`, 'account', u.status === 'LOCKED' ? 'Tài khoản đã bị khóa' : 'Tài khoản đã được mở khóa',
+        u.status === 'LOCKED' ? 'Quản trị viên đã khóa tài khoản của bạn. Hãy liên hệ quản trị viên nếu cần hỗ trợ.' : 'Quản trị viên đã mở khóa tài khoản của bạn.');
+      refreshRows(); toast(locked(u) ? 'Đã khóa tài khoản' : 'Đã mở khóa'); },   // TODO: PATCH /api/users/:id/lock
     role: id => { const u = findUser(id); if (!u) return; if (id === session.email) return toast('Bạn không thể đổi quyền của chính mình');
       const r = u.role === 'ADMIN' ? 'USER' : 'ADMIN';
-      confirmBox(`Đổi quyền của ${u.name} thành ${r}?`, () => { const x = findUser(id); if (!x) return; x.role = r; saveUsers(); refreshRows(); toast('Đã cập nhật quyền'); }); },   // TODO: PATCH /api/users/:id/role
+      confirmBox(`Đổi quyền của ${u.name} thành ${r}?`, () => { const x = findUser(id); if (!x) return; x.role = r; saveUsers();
+        recordNotification(id, `account:role:${r}:${uid()}`, 'account', 'Quyền tài khoản đã thay đổi', `Quản trị viên đã cập nhật quyền của bạn thành ${r}.`);
+        refreshRows(); toast('Đã cập nhật quyền'); }); },   // TODO: PATCH /api/users/:id/role
     delUser: id => { const u = findUser(id); if (!u) return; if (id === session.email) return toast('Bạn không thể xóa chính mình');
       confirmBox(`Xóa ${u.name} cùng toàn bộ giao dịch, danh mục của họ?`, () => {
         db.users = db.users.filter(x => x.email !== id); db.tx = db.tx.filter(t => t.owner !== id); db.cats = db.cats.filter(c => c.owner !== id);
@@ -1034,9 +2253,11 @@
       if (isAdmin && db.users.filter(u => u.role === 'ADMIN').length <= 1) return toast('Không thể xóa quản trị viên cuối cùng', 3200);
       confirmBox('Xóa vĩnh viễn tài khoản và toàn bộ dữ liệu của bạn?', () => {
         const e = session.email;
-        db.users = db.users.filter(u => u.email !== e); db.tx = db.tx.filter(t => t.owner !== e); db.cats = db.cats.filter(c => c.owner !== e);
-        db.budgets = db.budgets.filter(b => b.owner !== e); db.goals = db.goals.filter(g => g.owner !== e); db.accounts = db.accounts.filter(a => a.owner !== e);
-        saveUsers(); saveTx(); saveCats(); saveBudgets(); saveGoals(); saveAccounts(); leave(); }); },   // TODO: DELETE /api/account
+        const removedAccounts = db.accounts.filter(account => account.owner === e && !accountIsFamily(account));
+        const removedAccountIds = new Set(removedAccounts.map(account => account.id));
+        db.users = db.users.filter(u => u.email !== e); db.tx = db.tx.filter(t => t.owner !== e || t.scope === 'family'); db.cats = db.cats.filter(c => c.owner !== e);
+        db.budgets = db.budgets.filter(b => b.owner !== e); db.goals = db.goals.filter(g => g.owner !== e); db.accounts = db.accounts.filter(account => account.owner !== e || accountIsFamily(account)); db.accountAdjustments = db.accountAdjustments.filter(entry => !removedAccountIds.has(entry.accountId));
+        saveUsers(); saveTx(); saveCats(); saveBudgets(); saveGoals(); saveAccounts(); saveAccountAdjustments(); leave(); }); },   // TODO: DELETE /api/account
     logout: () => leave()
   };
 
@@ -1046,61 +2267,234 @@
       const errors = {}, name = (d.aname || '').trim(), openingBalance = Number(d.aopening);
       if (!name || name.length > 80) errors.aname = 'Nhập tên tài khoản (tối đa 80 ký tự)';
       if (!ACCOUNT_TYPES.some(([key]) => key === d.atype)) errors.atype = 'Chọn loại tài khoản';
-      if (!Number.isFinite(openingBalance) || openingBalance < 0) errors.aopening = 'Số dư ban đầu không được âm';
+      if (!Number.isFinite(openingBalance) || openingBalance < 0 || openingBalance > 999999999999) errors.aopening = 'Số dư ban đầu phải hợp lệ và không âm';
+      if (!['personal', 'family'].includes(d.accountScope)) errors.accountScope = 'Chọn không gian ví hợp lệ';
+      const family = d.accountScope === 'family' ? familyOf(d.accountFamilyId) : null;
+      if (d.accountScope === 'family' && (!family || !familyMemberOf(family.id) || !canManageFamily(family.id))) errors.accountFamilyId = 'Chỉ chủ gia đình hoặc người quản lý mới tạo được ví quỹ chung';
       if ((d.anote || '').length > 500) errors.anote = 'Mô tả không được vượt quá 500 ký tự';
-      if (db.accounts.some(account => account.owner === session.email && account.name.toLocaleLowerCase('vi') === name.toLocaleLowerCase('vi'))) errors.aname = 'Tên tài khoản đã tồn tại';
+      if (db.accounts.some(account => account.owner === session.email && (account.scope || 'personal') === (d.accountScope === 'family' ? 'family' : 'personal') && (account.familyId || '') === (family?.id || '') && account.name.toLocaleLowerCase('vi') === name.toLocaleLowerCase('vi'))) errors.aname = 'Tên tài khoản đã tồn tại trong không gian này';
       if (!showErr(f, errors)) return;
-      db.accounts.push({ id: uid(), owner: session.email, name, type: d.atype, openingBalance, note: (d.anote || '').trim(), createdAt: new Date().toISOString() });
-      saveAccounts(); delete S.showMoneyAccountForm; render(); toast('Đã thêm tài khoản');
+      const account = { id: uid(), owner: session.email, name, type: d.atype, openingBalance, note: (d.anote || '').trim(), scope: d.accountScope === 'family' ? 'family' : 'personal', ...(family ? { familyId: family.id } : {}), hidden: false, createdAt: new Date().toISOString() };
+      db.accounts.push(account);
+      try { saveAccounts(); } catch (error) {
+        db.accounts = db.accounts.filter(item => item.id !== account.id);
+        console.error('Unable to save money account', error);
+        toast('Không thể lưu ví. Vui lòng kiểm tra dung lượng lưu trữ trình duyệt.', 4200);
+        return;
+      }
+      recordNotification(session.email, `account:wallet-created:${account.id}`, 'account', 'Đã thêm ví / tài khoản tiền',
+        `${account.name} · Số dư đầu kỳ ${money(account.openingBalance)}.`);
+      const setupFamilyId = S.familyWalletSetup;
+      delete S.showMoneyAccountForm; delete S.familyWalletSetup;
+      if (setupFamilyId && familyMemberOf(setupFamilyId)) { S.familyId = setupFamilyId; S.familyTab = 'transactions'; page = 'family'; history.replaceState(null, '', '#family'); }
+      render(); toast(family ? 'Đã tạo ví quỹ chung' : 'Đã thêm ví cá nhân');
     },
     budget: (f, d) => {
       const errors = {}, amount = Number(d.bamount), editing = myBudgets().find(b => b.id === S.editBudget);
       const cat = catOf(d.bcat);
-      if (!cat || cat.type !== 'out' || !visCats().includes(cat)) errors.bcat = 'Chọn danh mục Chi hợp lệ';
+      if (!cat || cat.type !== 'out' || !categoryCanUse(cat, 'personal', '')) errors.bcat = 'Chọn danh mục Chi hợp lệ';
       if (!monthRe.test(d.bmonth || '')) errors.bmonth = 'Chọn tháng hợp lệ';
       if (!(amount > 0)) errors.bamount = 'Nhập ngân sách lớn hơn 0';
       if (db.budgets.some(b => b.id !== (editing && editing.id) && b.owner === session.email && b.catId === d.bcat && b.month === d.bmonth)) errors.bcat = 'Danh mục này đã có ngân sách trong tháng';
       if (!showErr(f, errors)) return;
       const value = { catId: d.bcat, month: d.bmonth, amount };
-      if (editing) Object.assign(editing, value);
+      if (editing) {
+        Object.assign(editing, value);
+        const savingsAccount = db.accounts.find(account => account.id === editing.accountId && account.goalId === editing.id);
+        if (savingsAccount) savingsAccount.name = `Tiết kiệm · ${name}`;
+      }
       else db.budgets.push({ id: uid(), owner: session.email, ...value });
       saveBudgets(); delete S.editBudget; render(); toast(editing ? 'Đã cập nhật ngân sách' : 'Đã tạo ngân sách');
     },
     goal: (f, d) => {
       const errors = {}, target = Number(d.gtarget), saved = Number(d.gsaved || 0), editing = myGoals().find(g => g.id === S.editGoal);
-      if (!d.gname.trim()) errors.gname = 'Nhập tên mục tiêu';
-      if (!(target > 0)) errors.gtarget = 'Nhập số tiền mục tiêu lớn hơn 0';
-      if (!(saved >= 0)) errors.gsaved = 'Số tiền đã tiết kiệm không hợp lệ';
-      if (!d.gdate) errors.gdate = 'Chọn ngày hoàn thành';
+      const name = (d.gname || '').trim();
+      if (!name || name.length > 100) errors.gname = 'Nhập tên mục tiêu (tối đa 100 ký tự)';
+      if (!Number.isFinite(target) || target <= 0 || target > 999999999999) errors.gtarget = 'Số tiền mục tiêu phải lớn hơn 0 và hợp lệ';
+      if (!editing && (!Number.isFinite(saved) || saved < 0 || saved > 999999999999)) errors.gsaved = 'Số dư ban đầu phải là số không âm và hợp lệ';
+      if (!d.gdate || !validReportDate(d.gdate)) errors.gdate = 'Chọn thời hạn hợp lệ';
       if (!showErr(f, errors)) return;
-      const value = { name: d.gname.trim(), target, saved, deadline: d.gdate, note: (d.gnote || '').trim() };
+      if ((d.gnote || '').length > 500) return showErr(f, { gnote: 'Ghi chú tối đa 500 ký tự' });
+      const previousGoals = db.goals, previousAccounts = db.accounts;
+      const value = { name, target, deadline: d.gdate, note: (d.gnote || '').trim() };
+      let goal;
       if (editing) Object.assign(editing, value);
-      else db.goals.push({ id: uid(), owner: session.email, ...value });
-      saveGoals(); delete S.editGoal; render(); toast(editing ? 'Đã cập nhật mục tiêu' : 'Đã tạo mục tiêu');
+      else {
+        goal = { id: uid(), owner: session.email, saved, ...value };
+        const savingsAccount = { id: uid(), owner: session.email, goalId: goal.id, name: `Tiết kiệm · ${name}`,
+          type: 'bank', openingBalance: saved, scope: 'personal', hidden: true, note: 'Ví nội bộ của mục tiêu tiết kiệm',
+          createdAt: new Date().toISOString() };
+        goal.accountId = savingsAccount.id;
+        db.goals = [...db.goals, goal]; db.accounts = [...db.accounts, savingsAccount];
+      }
+      try {
+        saveAccounts();
+        saveGoals();
+      } catch (error) {
+        db.goals = previousGoals; db.accounts = previousAccounts;
+        console.error('Unable to save savings goal', error);
+        toast('Không thể lưu mục tiêu tiết kiệm. Vui lòng kiểm tra dung lượng lưu trữ.', 4200);
+        return;
+      }
+      delete S.editGoal; render(); toast(editing ? 'Đã cập nhật mục tiêu' : 'Đã tạo mục tiêu');
     },
-    tx: (f, d) => { const e = {}; d.amount = Number(d.amount); const c = catOf(d.cat); const scope = d.scope === 'family' ? 'family' : 'personal'; const familyId = scope === 'family' ? (d.familyId || activeFamilyId()) : null;
-      if (!Number.isFinite(d.amount) || d.amount < 1000) e.amount = 'Số tiền tối thiểu là 1.000 ₫';
-      if (!d.cat) e.cat = 'Chọn danh mục'; else if (!c || c.type !== d.type || !visCats().includes(c)) e.cat = 'Danh mục không hợp lệ hoặc không đúng loại Thu/Chi';
-      if (!myAccounts().some(account => account.id === d.account && account.owner === session.email)) e.account = 'Chọn ví hoặc tài khoản của bạn';
-      if (d.payment && !PAYMENT_METHODS.some(([key]) => key === d.payment)) e.payment = 'Phương thức thanh toán không hợp lệ';
-      if (scope === 'family' && !familyId) e.familyId = 'Chọn gia đình';
-      if (scope === 'family' && !db.familyMembers.some(member => member.familyId === familyId && member.userEmail === session.email)) e.familyId = 'Bạn chưa thuộc gia đình này';
-      if (!d.date) e.date = 'Chọn ngày giao dịch';
-      else if (d.date > today()) e.date = 'Ngày giao dịch không được ở tương lai';
-      if ((d.note || '').length > 500) e.note = 'Mô tả không được vượt quá 500 ký tự';
-      if (!showErr(f, e)) return;
-      const v = { type: d.type, amount: d.amount, catId: d.cat, date: d.date, accountId: d.account, paymentMethod: d.payment || '', note: (d.note || '').trim(), scope, familyId, updatedAt: new Date().toISOString() };
-      const old = S.editTx && db.tx.find(t => t.id === S.editTx && t.owner === session.email);
-      if (old) Object.assign(old, v); else db.tx.push({ id: uid(), owner: d.actor || session.email, ...v, createdAt: v.updatedAt });   // TODO: POST/PUT /api/transactions
-      saveTx(); delete S.editTx; delete S.copyTx; render(); toast('Đã lưu giao dịch'); },
-    cat: (f, d) => { const e = {}; d.cname = d.cname.trim();
-      const ed = db.cats.find(c => c.id === S.editCat && canEditCat(c)), owner = ed ? ed.owner : (isAdmin ? '' : session.email);
-      if (!d.cname) e.cname = 'Nhập tên danh mục'; else if (db.cats.some(c => c.id !== (ed && ed.id) && (c.owner || '') === owner && c.name.toLowerCase() === d.cname.toLowerCase() && c.type === d.ctype)) e.cname = 'Danh mục này đã tồn tại';
-      if (!d.ctype) e.ctype = 'Chọn loại Thu hoặc Chi'; else if (ed && ed.type !== d.ctype && db.tx.some(t => t.catId === ed.id)) e.ctype = 'Danh mục đã có giao dịch, không thể đổi loại';
-      if (!showErr(f, e)) return;
-      const v = { name: d.cname, type: d.ctype, note: d.cnote.trim() };
-      if (ed) Object.assign(ed, v); else db.cats.push({ id: uid(), owner, ...v });   // TODO: POST/PUT /api/categories
-      saveCats(); delete S.editCat; render(); toast('Đã lưu danh mục'); },
+    goalMovement: (f, d) => {
+      const goal = myGoals().find(item => item.id === d.goalMovementGoalId);
+      const type = d.goalMovementType, amount = Number(d.goalMovementAmount);
+      const wallet = myAccounts().find(account => account.id === d.goalMovementAccount);
+      const savingsAccount = goal && db.accounts.find(account => account.id === goal.accountId && account.goalId === goal.id);
+      const errors = {};
+      if (!goal || !savingsAccount) return toast('Mục tiêu hoặc ví tiết kiệm không còn hợp lệ');
+      if (!['deposit', 'withdraw'].includes(type)) errors.goalMovementType = 'Chọn thao tác hợp lệ';
+      if (!Number.isFinite(amount) || amount <= 0 || amount > 999999999999) errors.goalMovementAmount = 'Nhập số tiền lớn hơn 0 và hợp lệ';
+      if (!wallet || !accountCanUse(wallet) || accountIsFamily(wallet)) errors.goalMovementAccount = 'Chọn ví cá nhân hợp lệ';
+      if (type === 'withdraw' && Number.isFinite(amount) && amount > goalSaved(goal)) errors.goalMovementAmount = 'Số tiền rút vượt quá số dư mục tiêu';
+      if ((d.goalMovementNote || '').length > 240) errors.goalMovementNote = 'Ghi chú tối đa 240 ký tự';
+      if (!showErr(f, errors)) return;
+      const transaction = { id: uid(), owner: session.email, type: 'transfer', amount, date: today(),
+        accountId: type === 'deposit' ? wallet.id : savingsAccount.id,
+        toAccountId: type === 'deposit' ? savingsAccount.id : wallet.id,
+        scope: 'personal', note: `${type === 'deposit' ? 'Đóng góp' : 'Rút tiền'} · ${goal.name}${d.goalMovementNote ? ` · ${d.goalMovementNote.trim()}` : ''}`,
+        createdAt: new Date().toISOString() };
+      const nextTransactions = [...db.tx, transaction];
+      try {
+        write(TX_KEY, nextTransactions);
+        db.tx = nextTransactions;
+      } catch (error) {
+        console.error('Unable to save savings goal transfer', error);
+        toast('Không thể ghi nhận giao dịch. Vui lòng thử lại.', 3800);
+        return;
+      }
+      dlg.close(); render();
+      toast(type === 'deposit' ? 'Đã đóng góp vào mục tiêu' : 'Đã rút tiền khỏi mục tiêu');
+    },
+    tx: async (f, d) => {
+      const errors = {}, amount = Number(d.amount), transfer = d.type === 'transfer';
+      const category = catOf(d.cat), scope = d.scope === 'family' ? 'family' : 'personal';
+      const familyId = scope === 'family' ? (d.familyId || activeFamilyId()) : null;
+      const sourceAccountId = transfer ? d.fromAccount : d.account;
+      const editingTransaction = S.editTx && db.tx.find(transaction => transaction.id === S.editTx && canEditFamilyTransaction(transaction));
+      const availableAccounts = transactionAccounts(scope, familyId);
+      editingTransaction && [editingTransaction.accountId, editingTransaction.toAccountId].forEach(id => {
+        const account = db.accounts.find(item => item.id === id);
+        if (account && accountIsFamily(account) === (scope === 'family') && (!accountIsFamily(account) || account.familyId === familyId) && !availableAccounts.some(item => item.id === account.id)) availableAccounts.push(account);
+      });
+      const sourceAccount = availableAccounts.find(account => account.id === sourceAccountId);
+      if (!Number.isFinite(amount) || amount <= 0 || amount > 999999999999) errors.amount = 'Nhập số tiền lớn hơn 0 và không vượt quá giới hạn';
+      if (!TRANSACTION_TYPES.some(([type]) => type === d.type)) errors.type = 'Chọn loại giao dịch hợp lệ';
+      if (!transfer && !d.cat) errors.cat = 'Chọn danh mục';
+      else if (!transfer && (category?.type !== d.type || (!categoryCanUse(category, scope, familyId) && editingTransaction?.catId !== category?.id)
+        || (category.hidden && editingTransaction?.catId !== category.id)
+        || (db.cats.some(child => child.parentId === category?.id && !child.hidden) && editingTransaction?.catId !== category.id))) errors.cat = 'Danh mục không hợp lệ hoặc không đúng loại Thu/Chi';
+      if (!sourceAccount || !accountCanUse(sourceAccount)) errors[transfer ? 'fromAccount' : 'account'] = 'Chọn ví thuộc phạm vi giao dịch';
+      if (transfer) {
+        const destination = availableAccounts.find(account => account.id === d.toAccount);
+        if (!destination || !accountCanUse(destination)) errors.toAccount = 'Chọn ví nhận hợp lệ';
+        else if (d.toAccount === sourceAccountId) errors.toAccount = 'Ví nhận phải khác ví nguồn';
+      } else if (d.payment && !PAYMENT_METHODS.some(([key]) => key === d.payment)) errors.payment = 'Phương thức thanh toán không hợp lệ';
+      if (scope === 'family' && !familyId) errors.familyId = 'Chọn gia đình';
+      if (scope === 'family' && !db.familyMembers.some(member => member.familyId === familyId && member.userEmail === session.email && member.status === 'ACTIVE')) errors.familyId = 'Bạn chưa là thành viên đang hoạt động của gia đình này';
+      if (!d.date) errors.date = 'Chọn ngày giao dịch';
+      else if (d.date > today()) errors.date = 'Ngày giao dịch không được ở tương lai';
+      if ((d.note || '').length > 500) errors.note = 'Mô tả không được vượt quá 500 ký tự';
+      const receiptFile = d.receipt instanceof File && d.receipt.size ? d.receipt : null;
+      if (receiptFile && receiptFile.size > 1024 * 1024) errors.receipt = 'Chứng từ không được lớn hơn 1 MB';
+      else if (receiptFile && !(/^image\/(jpeg|png|gif|webp|heic|heif)$/i.test(receiptFile.type) || receiptFile.type === 'application/pdf')) errors.receipt = 'Chỉ hỗ trợ ảnh hoặc tệp PDF';
+      if (d.recurrence && !['none', 'monthly'].includes(d.recurrence)) errors.recurrence = 'Chọn chu kỳ hợp lệ';
+      if (transfer && d.recurrence === 'monthly') errors.recurrence = 'Chuyển ví không hỗ trợ lặp định kỳ';
+      if (!showErr(f, errors)) return;
+      if (editingTransaction?.scope === 'family' && (scope !== 'family' || familyId !== editingTransaction.familyId)) return toast('Giao dịch dùng chung phải được giữ trong gia đình hiện tại');
+      const editing = S.editTx && db.tx.find(transaction => transaction.id === S.editTx);
+      if (S.editTx && (!editing || (!isAdmin && !canEditFamilyTransaction(editing)))) {
+        toast('Bạn không có quyền chỉnh sửa giao dịch này');
+        return;
+      }
+      const old = editing;
+      let receipt = old?.receipt;
+      if (d.receiptRemove === 'yes') receipt = undefined;
+      if (receiptFile) {
+        try {
+          receipt = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onerror = () => reject(reader.error || new Error('Unable to read receipt'));
+            reader.onload = () => resolve({ name: receiptFile.name, type: receiptFile.type, data: reader.result });
+            reader.readAsDataURL(receiptFile);
+          });
+        } catch (error) {
+          console.error('Unable to read transaction receipt', error);
+          toast('Không thể đọc chứng từ đã chọn. Vui lòng thử lại.', 3800);
+          return;
+        }
+      }
+      const now = new Date().toISOString();
+      const transaction = { ...(old || {}), id: old?.id || uid(), owner: old?.owner || (scope === 'family' ? d.actor || session.email : session.email),
+        type: transfer ? 'transfer' : d.type, amount, date: d.date, accountId: sourceAccountId, note: (d.note || '').trim(),
+        scope, familyId, updatedAt: now, ...(transfer ? { toAccountId: d.toAccount } : { catId: d.cat, paymentMethod: d.payment || '' }) };
+      if (transfer || d.recurrence !== 'monthly') delete transaction.recurrence;
+      else transaction.recurrence = 'monthly';
+      if (transfer || !receipt) delete transaction.receipt;
+      else transaction.receipt = receipt;
+      if (transfer) {
+        delete transaction.catId;
+        delete transaction.paymentMethod;
+        if (scope !== 'family') delete transaction.familyId;
+      } else delete transaction.toAccountId;
+      if (!old) transaction.createdAt = now;
+      const nextTransactions = old
+        ? db.tx.map(item => item.id === old.id ? transaction : item)
+        : [...db.tx, transaction];
+      try {
+        write(TX_KEY, nextTransactions);
+        db.tx = nextTransactions;
+      } catch (error) {
+        console.error('Unable to save transaction', error);
+        toast('Không thể lưu giao dịch. Hãy giảm dung lượng chứng từ hoặc kiểm tra bộ nhớ trình duyệt.', 4500);
+        return;
+      }
+      delete S.editTx; delete S.copyTx; render(); toast(old ? 'Đã cập nhật giao dịch' : 'Đã lưu giao dịch thành công');
+    },
+    cat: (f, d) => {
+      const errors = {}, editing = db.cats.find(category => category.id === S.editCat && canEditCat(category));
+      const originalScope = editing ? categoryScopeOf(editing) : '';
+      const scope = editing ? (originalScope === 'global' ? 'global' : originalScope === 'personal' ? 'personal' : 'family')
+        : isAdmin && d.categoryScope === 'global' ? 'global' : d.categoryScope === 'family' ? 'family' : 'personal';
+      const familyId = scope === 'family' ? (editing?.familyId || d.categoryFamilyId) : '';
+      const owner = editing ? editing.owner : (isAdmin ? '' : session.email);
+      const name = (d.cname || '').trim(), note = (d.cnote || '').trim();
+      const parent = d.cparent ? catOf(d.cparent) : null;
+      const allowedIcon = CATEGORY_ICONS.some(([icon]) => icon === d.cicon);
+      const validColor = /^#[0-9a-f]{6}$/i.test(d.ccolor || '');
+      if (!name || name.length > 60) errors.cname = 'Nhập tên danh mục (tối đa 60 ký tự)';
+      if (!TYPES.some(([type]) => type === d.ctype)) errors.ctype = 'Chọn loại Thu hoặc Chi';
+      if (scope === 'global' && !isAdmin) errors.categoryScope = 'Chỉ quản trị viên được tạo danh mục chung';
+      if (scope === 'family' && (!familyId || !familyOf(familyId) || (!isAdmin && !canManageFamily(familyId)))) errors.categoryFamilyId = 'Chọn gia đình hợp lệ hoặc kiểm tra quyền quản lý';
+      if (db.cats.some(category => category.id !== editing?.id && categoryScopeOf(category) === (scope === 'family' ? familyId : scope)
+        && (scope === 'family' || (category.owner || '') === owner) && category.type === d.ctype && category.name.toLocaleLowerCase('vi') === name.toLocaleLowerCase('vi')
+        && (category.parentId || '') === (parent?.id || ''))) errors.cname = 'Tên này đã được dùng trong cùng danh mục cha';
+      if (!allowedIcon) errors.cicon = 'Chọn biểu tượng trong danh sách';
+      if (!validColor) errors.ccolor = 'Chọn màu hợp lệ';
+      if (note.length > 240) errors.cnote = 'Mô tả tối đa 240 ký tự';
+      if (parent && (parent.hidden || parent.type !== d.ctype || parent.parentId || categoryScopeOf(parent) !== (scope === 'family' ? familyId : scope)
+        || !categoryCanUse(parent, scope, familyId))) errors.cparent = 'Danh mục cha phải đang hiển thị, cùng loại và cùng phạm vi';
+      const hasChildren = editing && db.cats.some(category => category.parentId === editing.id);
+      if (hasChildren && parent && parent.id !== editing.parentId) errors.cparent = 'Hãy xử lý danh mục con trước khi đổi cấp danh mục cha';
+      if (editing && editing.type !== d.ctype && (db.tx.some(transaction => transaction.catId === editing.id) || hasChildren)) errors.ctype = 'Không thể đổi loại khi danh mục đang được giao dịch hoặc danh mục con sử dụng';
+      if (editing && scope === 'family' && !isAdmin && !canManageFamily(editing.familyId)) errors.categoryFamilyId = 'Bạn không còn quyền quản lý danh mục gia đình này';
+      if (!showErr(f, errors)) return;
+      const previousCategories = db.cats.map(category => ({ ...category }));
+      const value = { name, type: d.ctype, note, icon: d.cicon, color: d.ccolor, parentId: parent?.id || '' };
+      if (editing) Object.assign(editing, value);
+      else db.cats.push({ id: uid(), owner, scope, ...(scope === 'family' ? { familyId } : {}), hidden: false, ...value });
+      try { saveCats(); } catch (error) {
+        db.cats = previousCategories;
+        console.error('Unable to save category', error);
+        toast('Không thể lưu danh mục. Vui lòng kiểm tra dung lượng lưu trữ trình duyệt.', 4200);
+        return;
+      }
+      // Đưa thư viện về đúng phạm vi vừa lưu để người dùng nhìn thấy danh mục mới.
+      S.catScope = scope === 'family' ? familyId : scope;
+      delete S.editCat; render(); toast(editing ? 'Đã cập nhật danh mục' : 'Đã tạo danh mục');
+    },
     account: async (f, d) => { const e = {}, me = findUser(session.email), email = d.email.trim().toLowerCase(), username = d.username.trim();
       if (d.name.trim().length < 2) e.name = 'Nhập họ và tên của bạn';
       if (!EMAIL_RE.test(email)) e.email = 'Email chưa đúng định dạng'; else if (db.users.some(u => u !== me && u.email === email)) e.email = 'Email này đã được đăng ký';
@@ -1110,17 +2504,23 @@
         if (d.pw.length < 8) e.pw = 'Cần ít nhất 8 ký tự'; if (d.pw !== d.pw2) e.pw2 = 'Mật khẩu xác nhận chưa khớp';
       }
       if (!showErr(f, e)) return;
-      const old = session.email;
+      const old = session.email, oldName = session.name, oldUsername = session.username;
       if (me) { Object.assign(me, { name: d.name.trim(), email, username }); if (d.pw) me.passwordHash = await hashPw(d.pw); saveUsers(); }
       if (old !== email) { db.tx.forEach(t => { if (t.owner === old) t.owner = email; }); db.cats.forEach(c => { if (c.owner === old) c.owner = email; });
         db.budgets.forEach(b => { if (b.owner === old) b.owner = email; }); db.goals.forEach(g => { if (g.owner === old) g.owner = email; }); db.accounts.forEach(a => { if (a.owner === old) a.owner = email; });
+        db.notifications.forEach(notification => { if (notification.owner === old) notification.owner = email; });
         saveTx(); saveCats(); saveBudgets(); saveGoals(); saveAccounts(); }
+      if (old !== email) saveNotifications();
       Object.assign(session, { name: d.name.trim(), email, username }); write(SESSION_KEY, session);   // TODO: PUT /api/account
-      $('#uname').textContent = session.name; f.elements.cpw.value = f.elements.pw.value = f.elements.pw2.value = ''; toast('Đã cập nhật tài khoản'); },
+      if (d.pw || old !== email || oldName !== session.name || oldUsername !== username) {
+        recordNotification(email, `account:profile:${uid()}`, 'account', 'Thông tin tài khoản đã được cập nhật',
+          d.pw ? 'Mật khẩu tài khoản vừa được thay đổi.' : 'Tên, email hoặc tên đăng nhập tài khoản vừa được thay đổi.');
+      }
+      $('#uname').textContent = session.name; f.elements.cpw.value = f.elements.pw.value = f.elements.pw2.value = ''; render(); toast('Đã cập nhật tài khoản'); },
     familySettings: (f, d) => {
       const family = activeFamily();
       const errors = {};
-      if (!family) return;
+      if (!family || family.ownerEmail !== session.email) return toast('Chỉ chủ gia đình mới được thay đổi cài đặt');
       const name = (d.familyName || '').trim();
       const description = (d.familyDescription || '').trim();
       const monthlyBudget = Number(d.familyBudget || 0);
@@ -1130,10 +2530,74 @@
       if (!showErr(f, errors)) return;
       family.name = name; family.description = description; family.monthlyBudget = monthlyBudget; saveFamilies(); render(); toast('Đã lưu thay đổi gia đình');
     },
+    familyBudgetSettings: (f, d) => {
+      const family = activeFamily(), amount = Number(d.familyBudgetAmount);
+      if (!family || !canManageFamily(family.id)) return toast('Bạn không có quyền điều chỉnh ngân sách gia đình');
+      if (d.familyBudgetAmount == null || String(d.familyBudgetAmount).trim() === '' || !Number.isFinite(amount) || amount < 0) {
+        showErr(f, { familyBudgetAmount: 'Ngân sách phải là số không âm' });
+        return;
+      }
+      family.monthlyBudget = amount;
+      saveFamilies(); delete S.editFamilyBudget; render(); toast('Đã cập nhật ngân sách gia đình');
+    },
+    familyCategoryBudget: (f, d) => {
+      const family = activeFamily();
+      if (!family || !canManageFamily(family.id)) return toast('Bạn không có quyền quản lý hạn mức danh mục của gia đình');
+      const editing = familyBudgets(family.id).find(budget => budget.id === S.editFamilyCategoryBudget);
+      const category = catOf(d.familyBudgetCategoryCat), amount = Number(d.familyBudgetCategoryAmount);
+      const errors = {};
+      if (!category || category.type !== 'out' || !categoryCanUse(category, 'family', family.id)) errors.familyBudgetCategoryCat = 'Chọn danh mục Chi thuộc phạm vi gia đình';
+      if (!monthRe.test(d.familyBudgetCategoryMonth || '')) errors.familyBudgetCategoryMonth = 'Chọn tháng hợp lệ';
+      if (!Number.isFinite(amount) || amount <= 0 || amount > 999999999999) errors.familyBudgetCategoryAmount = 'Hạn mức phải lớn hơn 0 và hợp lệ';
+      if (db.budgets.some(budget => budget.id !== editing?.id && budget.scope === 'family' && budget.familyId === family.id
+        && budget.catId === d.familyBudgetCategoryCat && budget.month === d.familyBudgetCategoryMonth)) {
+        errors.familyBudgetCategoryCat = 'Danh mục này đã có hạn mức trong tháng';
+      }
+      if (!showErr(f, errors)) return;
+      const previous = db.budgets.slice();
+      if (editing) Object.assign(editing, { catId: d.familyBudgetCategoryCat, month: d.familyBudgetCategoryMonth, amount });
+      else db.budgets.push({ id: uid(), scope: 'family', familyId: family.id, catId: d.familyBudgetCategoryCat,
+        month: d.familyBudgetCategoryMonth, amount, createdBy: session.email });
+      try {
+        saveBudgets();
+      } catch (error) {
+        db.budgets = previous;
+        console.error('Unable to save family category budget', error);
+        toast('Không thể lưu hạn mức. Vui lòng kiểm tra dung lượng lưu trữ trình duyệt.', 4200);
+        return;
+      }
+      S.familyBudgetMonth = d.familyBudgetCategoryMonth;
+      delete S.editFamilyCategoryBudget;
+      render(); toast(editing ? 'Đã cập nhật hạn mức danh mục' : 'Đã thêm hạn mức danh mục');
+    },
     report: (f, d) => {
-      if (d.rf && d.rt && d.rf > d.rt) { showErr(f, { rt: 'Đến ngày phải sau Từ ngày' }); return; }
-      showErr(f, {});
-      Object.assign(S, { rf: d.rf, rt: d.rt, ru: d.ru, rty: d.rty, rc: d.rc, rrun: true }); $('#repOut').innerHTML = reportOut(); },   // TODO: GET /api/reports
+      const errors = {};
+      const scope = d.reportScope || (isAdmin ? 'all' : 'personal');
+      if (!reportScopeOptions().some(([key]) => key === scope)) errors.reportScope = 'Không có quyền truy cập phạm vi báo cáo này';
+      if (!REPORT_PERIODS.some(([key]) => key === d.rperiod)) errors.rperiod = 'Chọn kỳ báo cáo hợp lệ';
+      if (d.rf && !validReportDate(d.rf)) errors.rf = 'Ngày bắt đầu không hợp lệ';
+      if (d.rt && !validReportDate(d.rt)) errors.rt = 'Ngày kết thúc không hợp lệ';
+      if (d.rf && d.rt && d.rf > d.rt) errors.rt = 'Đến ngày phải sau Từ ngày';
+      const familyScope = scope !== 'personal' && scope !== 'all';
+      if (d.rmember && (!familyScope || !familyMembersOf(scope).some(member => member.userEmail === d.rmember))) errors.rmember = 'Thành viên không thuộc phạm vi gia đình đã chọn';
+      if (d.raccount && !reportAccounts(scope).some(account => account.id === d.raccount)) errors.raccount = 'Ví không thuộc phạm vi báo cáo';
+      if (d.rc) {
+        const category = catOf(d.rc);
+        const categoryScope = familyScope ? 'family' : isAdmin ? 'all' : 'personal';
+        const valid = categoryScope === 'all'
+          ? !!category && !category.hidden && (isAdmin || categoryCanUse(category, 'personal', ''))
+          : !!category && categoryCanUse(category, categoryScope, familyScope ? scope : '');
+        if (!valid) errors.rc = 'Danh mục không thuộc phạm vi báo cáo';
+      }
+      if (!showErr(f, errors)) return;
+      Object.assign(S, {
+        rf: d.rf, rt: d.rt, rperiod: d.rperiod, reportScope: scope,
+        ru: isAdmin && scope === 'all' ? (d.ru || '') : '',
+        rmember: familyScope ? (d.rmember || '') : '',
+        rty: d.rty || '', rc: d.rc || '', raccount: d.raccount || '', rrun: true
+      });
+      $('#repOut').innerHTML = reportOut();
+    },
     noop: () => refreshRows()
   };
 
@@ -1144,12 +2608,88 @@
   document.addEventListener('submit', e => { const f = e.target.closest('form[data-f]'); if (!f) return; e.preventDefault(); FORM[f.dataset.f](f, Object.fromEntries(new FormData(f))); });
   document.addEventListener('input', e => {
     const t = e.target; t.closest('.field')?.classList.remove('invalid');
+    if (t.form?.dataset.f === 'cat' && ['cname', 'ccolor'].includes(t.name)) {
+      const preview = $('#categoryPreview', t.form);
+      if (preview && t.name === 'cname') preview.querySelector('b').textContent = t.value.trim() || 'Tên danh mục';
+      if (preview && t.name === 'ccolor') preview.style.setProperty('--category-color', /^#[0-9a-f]{6}$/i.test(t.value) ? t.value : '#2563eb');
+    }
     if (t.hasAttribute('data-live')) { S[t.id === 'dashboardScope' ? 'dashboardScope' : t.id] = t.value; if (t.id !== 'ps') S.pg = 1; refreshRows(); }
   });
   document.addEventListener('change', e => {
     const t = e.target;
+    if (t.form?.dataset.f === 'report' && t.id === 'rperiod') {
+      S.rperiod = t.value;
+      if (t.value !== 'custom') {
+        const [start, end] = reportRange(t.value);
+        t.form.elements.rf.value = start; t.form.elements.rt.value = end;
+      }
+    }
+    if (t.form?.dataset.f === 'report' && ['rf', 'rt'].includes(t.id)) {
+      t.form.elements.rperiod.value = 'custom';
+      S.rperiod = 'custom';
+    }
+    if (t.form?.dataset.f === 'report' && t.id === 'reportScope') {
+      S.rf = t.form.elements.rf.value; S.rt = t.form.elements.rt.value;
+      S.rperiod = t.form.elements.rperiod.value; S.reportScope = t.value;
+      ['raccount', 'rmember', 'rc', 'ru', 'rty'].forEach(key => delete S[key]);
+      render(); return;
+    }
+    if (t.form?.dataset.f === 'tx' && (t.matches('input[name="scope"]') || t.id === 'familyId')) {
+      updateTransactionAccountOptions(t.form);
+      updateTransactionCategoryOptions(t.form);
+    }
+    if (t.form?.dataset.f === 'cat' && ['categoryScope', 'categoryFamilyId', 'ctype'].includes(t.name)) {
+      const familyField = $('#categoryFamilyField', t.form);
+      if (familyField && t.name === 'categoryScope') familyField.hidden = t.value !== 'family';
+      updateCategoryParentOptions(t.form);
+    }
+    if (t.id === 'accountScope') {
+      const familyFields = t.form?.querySelector('#familyAccountFields');
+      if (familyFields) familyFields.hidden = t.value !== 'family';
+    }
+    if (t.id === 'familyProfileMonth') {
+      if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(t.value)) return toast('Tháng được chọn không hợp lệ');
+      S.familyProfileMonth = t.value; render(); return;
+    }
+    if (t.id === 'familyBudgetMonth') {
+      if (!monthRe.test(t.value)) return toast('Tháng được chọn không hợp lệ');
+      S.familyBudgetMonth = t.value; delete S.editFamilyCategoryBudget; render(); return;
+    }
+    if (t.id === 'familySelector') {
+      if (!myFamilyMemberships().some(member => member.familyId === t.value)) return toast('Không có quyền truy cập gia đình này');
+      S.familyId = t.value; delete S.familyProfileEmail; delete S.familyProfileTab; delete S.familyProfileMonth;
+      ['familyTxSearch', 'familyTxMember', 'familyTxMonth', 'familyTxType', 'editFamilyBudget', 'familyBudgetMonth', 'editFamilyCategoryBudget'].forEach(key => delete S[key]);
+      render(); return;
+    }
+    if (t.id === 'dashboardScope' && page === 'dash') {
+      delete S.dashboardAccount;
+      render(); return;
+    }
     if (t.hasAttribute('data-live')) { S[t.id === 'dashboardScope' ? 'dashboardScope' : t.id] = t.value; if (t.id !== 'ps') S.pg = 1; refreshRows(); }
-    if (t.id === 'type' && t.form?.dataset.f === 'tx') $('#cat', t.form).innerHTML = catOpts('', 'Chọn danh mục', t.value);   // chỉ hiện danh mục đúng loại Thu/Chi
+    if (t.id === 'scopeFilter' && page === 'tx') { delete S.fc; delete S.fm; render(); }
+    if (t.id === 'type' && t.form?.dataset.f === 'tx') {
+      const transfer = t.value === 'transfer';
+      const categoryField = $('#txCategoryField', t.form), transferFields = $('#txTransferFields', t.form), regularFields = $('#txRegularFields', t.form);
+      if (categoryField) categoryField.hidden = transfer;
+      if (transferFields) transferFields.hidden = !transfer;
+      if (regularFields) regularFields.hidden = transfer;
+      if (transfer) {
+        const recurrence = $('#recurrence', t.form);
+        if (recurrence) recurrence.value = 'none';
+      }
+      updateTransactionAccountOptions(t.form);
+      if (!transfer) updateTransactionCategoryOptions(t.form);
+    }
+  });
+  window.addEventListener('storage', event => {
+    if (['et_tx', 'et_cats', 'et_budgets', 'et_accounts', 'et_account_adjustments', 'et_families', 'et_family_members', 'et_family_invites', 'et_family_fund_entries', 'et_users', NOTIFICATIONS_KEY].includes(event.key)) {
+      sync();
+      // Nhận danh mục mới từ tab quản trị mà không xóa dữ liệu người dùng đang nhập.
+      if (event.key === 'et_cats' && page === 'tx') {
+        const form = document.querySelector('form[data-f="tx"]');
+        if (form) updateTransactionCategoryOptions(form);
+      } else if (event.key === NOTIFICATIONS_KEY || ['dash', 'family', 'moneyAccounts', 'report', 'budget', 'goals', 'notifications', 'cats'].includes(page)) render();
+    }
   });
   $('#menuBtn').onclick = () => $('#side').classList.toggle('open');
   render();
