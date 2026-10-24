@@ -1,0 +1,35 @@
+# Addition to docker-compose.yml: NEW isolated PostgreSQL database, no modification of existing postgres_data.
+services:
+  postgres_demo:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: expense_tracker_demo
+      POSTGRES_USER: expense_demo
+      POSTGRES_PASSWORD: ${DEMO_DB_PASSWORD:?Run setup_demo.ps1 to generate .env.demo}
+    ports:
+      - '127.0.0.1:5435:5432'
+    volumes:
+      - expense_demo_pg_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U expense_demo -d expense_tracker_demo']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  pgadmin_demo:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@expense-demo.com
+      PGADMIN_DEFAULT_PASSWORD: ${DEMO_PGADMIN_PASSWORD:?Run setup_demo.ps1 first}
+    ports:
+      - '127.0.0.1:5051:80'
+    volumes:
+      - expense_demo_pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      postgres_demo:
+        condition: service_healthy
+volumes:
+  expense_demo_pg_data:
+  expense_demo_pgadmin_data:

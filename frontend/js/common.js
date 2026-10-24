@@ -31,28 +31,74 @@
      Gợi ý: GET/POST/PUT/DELETE /api/transactions, /api/categories, /api/users, /api/reports */
   const ROLE = document.body.dataset.role, isAdmin = ROLE === 'ADMIN';
   const REQUIRE_LOGIN = true;   // index.html đã đăng nhập thật (localStorage) nên bật kiểm tra phiên
-  const USERS_KEY = 'et_users', SESSION_KEY = 'et_session', TX_KEY = 'et_tx', CAT_KEY = 'et_cats';
+  const USERS_KEY = 'et_users', SESSION_KEY = 'et_session', CAT_KEY = 'et_cats';
+  const activeSession = (() => { try { return JSON.parse(localStorage.getItem(SESSION_KEY)); } catch (_) { return null; } })();
+  const SERVER_MODE = location.port === '8080';
+  const TX_KEY = SERVER_MODE ? 'et_tx_postgres_' + (activeSession?.email || 'unknown') : 'et_tx';
   const BUDGET_KEY = 'et_budgets', GOAL_KEY = 'et_goals', ACCOUNTS_KEY = 'et_accounts';
   const read = (k, d) => { try { const v = JSON.parse(localStorage.getItem(k)); return v == null ? d : v; } catch (_) { return d; } };
   const write = (k, v) => localStorage.setItem(k, JSON.stringify(v));
-  const leave = () => { localStorage.removeItem(SESSION_KEY); location.href = 'index.html'; };
+  const leave = () => { sessionStorage.removeItem('et_api_token'); localStorage.removeItem(SESSION_KEY); location.href = 'index.html'; };
+  async function apiRequest(url, init = {}) {
+    const token = sessionStorage.getItem('et_api_token');
+    if (!token) { leave(); throw new Error('Phiên đăng nhập API đã hết. Vui lòng đăng nhập lại.'); }
+    let response;
+    try { response = await fetch('/api/' + url, {
+      ...init, headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json', ...(init.headers || {}) }
+    }); } catch { throw new Error('Không kết nối được backend. Kiểm tra Terminal và Nginx.'); }
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.message || 'Lỗi máy chủ (' + response.status + ')');
+    return data;
+  }
+  function fromApiAdjustment(row) {
+    return { id: row.id, accountId: row.account_id, owner: row.adjusted_by || session.email,
+      delta: asMoney(row.delta ?? row.amount), note: row.note || '', createdAt: row.created_at };
+  }
   let session = read(SESSION_KEY, null);
   if (!session) {
     if (REQUIRE_LOGIN) { location.href = 'index.html'; return; }
     session = { name: isAdmin ? 'Quản trị viên' : 'Người dùng', email: '', username: '', role: ROLE };
   } else if (session.role !== ROLE) { location.href = session.role === 'ADMIN' ? 'admin.html' : 'user.html'; return; }
-  else if (REQUIRE_LOGIN) {
+  else if (SERVER_MODE && (!session.backend || !sessionStorage.getItem('et_api_token'))) { leave(); return; }
+  else if (REQUIRE_LOGIN && !SERVER_MODE) {
     const me = read(USERS_KEY, []).find(u => u.email === session.email);
     if (!me || me.status === 'LOCKED' || me.role !== ROLE) { leave(); return; }   // bị xóa / khóa / đổi quyền → đăng nhập lại
   }
 
   const FAMILY_KEY = 'et_families', FAMILY_MEMBERS_KEY = 'et_family_members', FAMILY_INVITES_KEY = 'et_family_invites', FAMILY_FUND_KEY = 'et_family_fund_entries', ACCOUNT_ADJUSTMENTS_KEY = 'et_account_adjustments', NOTIFICATIONS_KEY = 'et_notifications';
   const db = { tx: read(TX_KEY, []), cats: read(CAT_KEY, []), users: read(USERS_KEY, []), budgets: read(BUDGET_KEY, []), goals: read(GOAL_KEY, []), accounts: read(ACCOUNTS_KEY, []), families: read(FAMILY_KEY, []), familyMembers: read(FAMILY_MEMBERS_KEY, []), familyInvites: read(FAMILY_INVITES_KEY, []), familyFundEntries: read(FAMILY_FUND_KEY, []), accountAdjustments: read(ACCOUNT_ADJUSTMENTS_KEY, []), notifications: read(NOTIFICATIONS_KEY, []) };
-  const saveUsers = () => write(USERS_KEY, db.users), saveTx = () => write(TX_KEY, db.tx), saveCats = () => write(CAT_KEY, db.cats);
-  const saveBudgets = () => write(BUDGET_KEY, db.budgets), saveGoals = () => write(GOAL_KEY, db.goals), saveAccounts = () => write(ACCOUNTS_KEY, db.accounts), saveAccountAdjustments = () => write(ACCOUNT_ADJUSTMENTS_KEY, db.accountAdjustments);
-  const saveFamilies = () => write(FAMILY_KEY, db.families), saveFamilyMembers = () => write(FAMILY_MEMBERS_KEY, db.familyMembers), saveFamilyInvites = () => write(FAMILY_INVITES_KEY, db.familyInvites), saveFamilyFundEntries = () => write(FAMILY_FUND_KEY, db.familyFundEntries);
-  const saveNotifications = () => write(NOTIFICATIONS_KEY, db.notifications);
-  const sync = () => { db.users = read(USERS_KEY, []); db.tx = read(TX_KEY, []); db.cats = read(CAT_KEY, []); db.budgets = read(BUDGET_KEY, []); db.goals = read(GOAL_KEY, []); db.accounts = read(ACCOUNTS_KEY, []); db.families = read(FAMILY_KEY, []); db.familyMembers = read(FAMILY_MEMBERS_KEY, []); db.familyInvites = read(FAMILY_INVITES_KEY, []); db.familyFundEntries = read(FAMILY_FUND_KEY, []); db.accountAdjustments = read(ACCOUNT_ADJUSTMENTS_KEY, []); db.notifications = read(NOTIFICATIONS_KEY, []); };
+  let serverStateReady = false, serverSaveQueue = Promise.resolve();
+  const saveLocal = (key, value) => { if (!SERVER_MODE) write(key, value); };
+  const queueServerSave = resource => {
+    if (!SERVER_MODE || !serverStateReady) return Promise.resolve();
+    serverSaveQueue = serverSaveQueue.then(() => persistServerResource(resource)).catch(error => {
+      console.error(`Unable to persist ${resource}`, error);
+      toast(`Không thể lưu ${resource} lên máy chủ: ${error.message}`, 5500);
+    });
+    return serverSaveQueue;
+  };
+  const saveUsers = () => { saveLocal(USERS_KEY, db.users); return queueServerSave('users'); };
+  const saveTx = () => saveLocal(TX_KEY, db.tx);
+  const saveCats = () => { saveLocal(CAT_KEY, db.cats); return queueServerSave('categories'); };
+  const saveBudgets = () => { saveLocal(BUDGET_KEY, db.budgets); return queueServerSave('budgets'); };
+  const saveGoals = () => { saveLocal(GOAL_KEY, db.goals); return queueServerSave('goals'); };
+  const saveAccounts = () => { saveLocal(ACCOUNTS_KEY, db.accounts); return queueServerSave('accounts'); };
+  const saveAccountAdjustments = () => saveLocal(ACCOUNT_ADJUSTMENTS_KEY, db.accountAdjustments);
+  const saveFamilies = () => { saveLocal(FAMILY_KEY, db.families); return queueServerSave('families'); };
+  const saveFamilyMembers = () => { saveLocal(FAMILY_MEMBERS_KEY, db.familyMembers); return queueServerSave('familyMembers'); };
+  const saveFamilyInvites = () => { saveLocal(FAMILY_INVITES_KEY, db.familyInvites); return queueServerSave('familyInvites'); };
+  const saveFamilyFundEntries = () => saveLocal(FAMILY_FUND_KEY, db.familyFundEntries);
+  const saveNotifications = () => saveLocal(NOTIFICATIONS_KEY, db.notifications);
+  const legacyLocalData = SERVER_MODE ? JSON.parse(JSON.stringify(db)) : null;
+  if (SERVER_MODE) {
+    db.tx = []; db.cats = []; db.users = []; db.budgets = []; db.goals = []; db.accounts = [];
+    db.families = []; db.familyMembers = []; db.familyInvites = []; db.familyFundEntries = [];
+    db.accountAdjustments = []; db.notifications = [];
+  }
+  const sync = () => {
+    if (SERVER_MODE && serverStateReady) return;
+    db.users = read(USERS_KEY, []); db.tx = read(TX_KEY, []); db.cats = read(CAT_KEY, []); db.budgets = read(BUDGET_KEY, []); db.goals = read(GOAL_KEY, []); db.accounts = read(ACCOUNTS_KEY, []); db.families = read(FAMILY_KEY, []); db.familyMembers = read(FAMILY_MEMBERS_KEY, []); db.familyInvites = read(FAMILY_INVITES_KEY, []); db.familyFundEntries = read(FAMILY_FUND_KEY, []); db.accountAdjustments = read(ACCOUNT_ADJUSTMENTS_KEY, []); db.notifications = read(NOTIFICATIONS_KEY, []);
+  };
   const notificationsForMe = () => db.notifications.filter(notification => notification.owner === session.email)
     .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
   const unreadNotificationCount = () => notificationsForMe().filter(notification => !notification.readAt).length;
@@ -252,6 +298,7 @@
     return transaction.type === 'in' ? Number(transaction.amount || 0) : transaction.type === 'out' ? -Number(transaction.amount || 0) : 0;
   };
   const accountBalance = account => {
+    if (SERVER_MODE && Number.isFinite(Number(account.balance))) return Number(account.balance);
     const transactionBalance = db.tx.filter(transaction => accountIsFamily(account)
       ? transaction.scope === 'family' && transaction.familyId === account.familyId
       : transaction.owner === account.owner && transaction.scope !== 'family')
@@ -307,6 +354,371 @@
   }
   const PAYMENT_METHODS = [['cash', 'Tiền mặt'], ['bank', 'Chuyển khoản'], ['card', 'Thẻ ngân hàng'], ['wallet', 'Ví điện tử']];
   const paymentLabel = value => PAYMENT_METHODS.find(([key]) => key === value)?.[1] || 'Chưa chọn';
+  const serverSnapshots = {};
+  const unwrapApi = response => response?.data ?? response;
+  const asMoney = value => Number(value || 0);
+  const dateOnly = value => value ? String(value).slice(0, 10) : '';
+  const monthOnly = value => dateOnly(value).slice(0, 7);
+  function fromApiCategory(row) {
+    return { id: row.id, name: row.name, type: row.type, note: row.description || '',
+      owner: row.user_id === session.userId ? session.email : '', scope: row.family_id ? 'family' : row.user_id === session.userId ? 'personal' : 'global',
+      familyId: row.family_id || '', parentId: row.parent_id || '', hidden: !!row.is_hidden || row.is_active === false };
+  }
+  function fromApiAccount(row) {
+    return { id: row.id, owner: row.family_id ? session.email : session.email, name: row.name, type: row.type,
+      openingBalance: asMoney(row.opening_balance), balance: asMoney(row.balance), currency: row.currency || 'VND',
+      scope: row.family_id ? 'family' : 'personal', familyId: row.family_id || '', hidden: row.is_active === false,
+      createdAt: row.created_at };
+  }
+  function fromApiBudget(row) {
+    return { id: row.id, owner: row.family_id ? '' : session.email, scope: row.family_id ? 'family' : 'personal',
+      familyId: row.family_id || '', catId: row.category_id, month: monthOnly(row.month), amount: asMoney(row.amount),
+      spent: asMoney(row.spent) };
+  }
+  function fromApiGoal(row) {
+    return { id: row.id, owner: row.family_id ? '' : session.email, scope: row.family_id ? 'family' : 'personal',
+      familyId: row.family_id || '', name: row.name, target: asMoney(row.target), saved: asMoney(row.saved),
+      deadline: dateOnly(row.deadline), note: row.note || '', contributions: (row.contributions || []).map(item => ({
+        id: item.id, amount: asMoney(item.amount), date: dateOnly(item.event_date || item.contribution_date),
+        note: item.note || '', eventType: item.event_type || 'DEPOSIT'
+      })) };
+  }
+  function fromApiFamily(row) {
+    return { id: row.id, name: row.name, ownerEmail: row.owner_email || (row.my_role === 'OWNER' ? session.email : ''),
+      role: row.my_role, memberCount: Number(row.member_count || 0), monthlyBudget: asMoney(row.monthly_budget),
+      description: row.settings?.description || '', code: row.code || '', createdAt: row.created_at };
+  }
+  function fromApiMember(row, familyId) {
+    const userId = row.user_id || row.id;
+    return { id: userId, familyId, userId, userEmail: row.email, role: row.role, status: row.status,
+      joinedAt: row.joined_at, user: { id: userId, email: row.email, name: row.full_name, username: row.username, role: 'USER', status: 'ACTIVE' } };
+  }
+  function fromApiInvite(row, familyId) {
+    return { id: row.id, familyId: familyId || row.family_id, email: row.email, role: row.role, status: row.status,
+      inviterEmail: row.inviter_email || '', inviterName: row.inviter_name || '', familyName: row.family_name || '',
+      createdAt: row.created_at, expiresAt: row.expires_at, token: row.token || '' };
+  }
+  function fromApiNotification(row) {
+    return { id: row.id, owner: session.email, type: row.type, title: row.title, text: row.message || '',
+      eventKey: row.payload?.eventKey || '', familyId: row.payload?.familyId || '', createdAt: row.created_at,
+      ...(row.is_read ? { readAt: row.read_at || row.created_at } : {}) };
+  }
+  function fromApiUser(row) {
+    return { id: row.id, name: row.full_name, username: row.username, email: row.email, role: row.role,
+      status: row.status, createdAt: row.created_at };
+  }
+  function fromApiTransaction(row) {
+    if (!db.cats.some(category => category.id === row.category_id) || !db.accounts.some(account => account.id === row.account_id)) {
+      throw new Error('Giao dịch tham chiếu đến danh mục hoặc ví không có trong dữ liệu máy chủ.');
+    }
+    return { id: row.id, owner: row.owner_email || session.email, type: row.type, amount: asMoney(row.amount),
+      date: dateOnly(row.transaction_date), catId: row.category_id, accountId: row.account_id,
+      note: row.note || '', paymentMethod: row.payment_method || 'cash', scope: row.scope || 'personal',
+      familyId: row.family_id || '', createdAt: row.created_at, apiSynced: true };
+  }
+  function fromApiTransfer(row) {
+    if (!db.accounts.some(account => account.id === row.from_account) || !db.accounts.some(account => account.id === row.to_account)) {
+      throw new Error('Chuyển ví tham chiếu đến ví không có trong dữ liệu máy chủ.');
+    }
+    return { id: row.id, owner: row.owner_email || session.email, type: 'transfer', amount: asMoney(row.amount),
+      date: dateOnly(row.transfer_date), accountId: row.from_account, toAccountId: row.to_account,
+      note: row.note || '', scope: row.family_id ? 'family' : 'personal', familyId: row.family_id || '',
+      createdAt: row.created_at, apiSynced: true };
+  }
+  function remapServerId(resource, oldId, newId) {
+    if (!oldId || oldId === newId) return;
+    const rows = {
+      categories: db.cats, accounts: db.accounts, budgets: db.budgets, goals: db.goals, families: db.families
+    }[resource];
+    const row = rows?.find(item => item.id === oldId);
+    if (row) row.id = newId;
+    if (resource === 'categories') {
+      db.cats.forEach(item => { if (item.parentId === oldId) item.parentId = newId; });
+      db.tx.forEach(item => { if (item.catId === oldId) item.catId = newId; });
+      db.budgets.forEach(item => { if (item.catId === oldId) item.catId = newId; });
+    } else if (resource === 'accounts') {
+      db.tx.forEach(item => { if (item.accountId === oldId) item.accountId = newId; if (item.toAccountId === oldId) item.toAccountId = newId; });
+      db.goals.forEach(item => { if (item.accountId === oldId) item.accountId = newId; });
+      db.accountAdjustments.forEach(item => { if (item.accountId === oldId) item.accountId = newId; });
+    } else if (resource === 'families') {
+      db.accounts.forEach(item => { if (item.familyId === oldId) item.familyId = newId; });
+      db.tx.forEach(item => { if (item.familyId === oldId) item.familyId = newId; });
+      db.budgets.forEach(item => { if (item.familyId === oldId) item.familyId = newId; });
+      db.goals.forEach(item => { if (item.familyId === oldId) item.familyId = newId; });
+      db.familyMembers.forEach(item => { if (item.familyId === oldId) item.familyId = newId; });
+      db.familyInvites.forEach(item => { if (item.familyId === oldId) item.familyId = newId; });
+    }
+    const snapshot = serverSnapshots[resource];
+    if (snapshot instanceof Map && snapshot.has(oldId)) {
+      const baseline = snapshot.get(oldId);
+      snapshot.delete(oldId);
+      snapshot.set(newId, baseline);
+    }
+  }
+  async function legacyImportPayload() {
+    const source = legacyLocalData || db;
+    const memberships = source.familyMembers.filter(member => member.userEmail === session.email && member.status === 'ACTIVE');
+    const familyIds = new Set(memberships.map(member => member.familyId));
+    return {
+      source_key: `expense-tracker-local-v1:${session.email.toLowerCase()}`,
+      categories: source.cats.filter(category => category.owner === session.email),
+      accounts: source.accounts.filter(account => account.owner === session.email || familyIds.has(account.familyId)),
+      transactions: source.tx.filter(transaction => transaction.owner === session.email || familyIds.has(transaction.familyId)),
+      budgets: source.budgets.filter(budget => budget.owner === session.email || familyIds.has(budget.familyId)),
+      goals: source.goals.filter(goal => goal.owner === session.email || familyIds.has(goal.familyId)),
+      families: source.families.filter(family => family.ownerEmail === session.email || familyIds.has(family.id)),
+      family_members: memberships.map(member => ({ familyId: member.familyId, is_self: true, role: member.role })),
+      family_invites: source.familyInvites.filter(invite => familyIds.has(invite.familyId)),
+      notifications: source.notifications.filter(notification => notification.owner === session.email)
+    };
+  }
+  async function loadServerWorkspace() {
+    const profileResult = unwrapApi(await apiRequest('profile'));
+    const profile = profileResult.user;
+    if (!profile || !profile.id || profile.status !== 'ACTIVE') { leave(); return; }
+    session = { ...session, userId: profile.id, name: profile.full_name, username: profile.username, email: profile.email, role: profile.role, backend: true };
+    if (session.role !== ROLE) { write(SESSION_KEY, session); location.href = session.role === 'ADMIN' ? 'admin.html' : 'user.html'; return; }
+    write(SESSION_KEY, session);
+    $('#uname').textContent = session.name;
+    const importResult = await apiRequest('import/local', { method: 'POST', body: JSON.stringify(await legacyImportPayload()) });
+    const responseList = async (path, key) => {
+      const response = unwrapApi(await apiRequest(path));
+      return response[key] || [];
+    };
+    const [categories, accounts, transactions, transfers, budgets, goals, families, notifications, adminUsers, incomingInvites] = await Promise.all([
+      responseList('categories?include_hidden=true&include_inactive=true', 'categories'),
+      responseList('accounts?include_inactive=true', 'accounts'),
+      apiRequest('transactions?scope=all').then(result => result.transactions || []), responseList('transfers', 'transfers'),
+      responseList('budgets', 'budgets'), responseList('goals', 'goals'), responseList('families', 'families'),
+      responseList('notifications?limit=100', 'notifications'),
+      isAdmin ? responseList('admin/users?limit=500', 'users') : Promise.resolve([]),
+      responseList('families/invites', 'invites')
+    ]);
+    db.cats = categories.map(fromApiCategory);
+    db.accounts = accounts.map(fromApiAccount);
+    db.families = families.map(fromApiFamily);
+    const memberResults = await Promise.all(db.families.map(async family => {
+      const members = await responseList(`families/${encodeURIComponent(family.id)}/members`, 'members');
+      const invites = ['OWNER', 'MANAGER'].includes(family.role)
+        ? await responseList(`families/${encodeURIComponent(family.id)}/invites`, 'invites') : [];
+      return { familyId: family.id, members, invites };
+    }));
+    db.familyMembers = memberResults.flatMap(item => item.members.map(member => fromApiMember(member, item.familyId)));
+    db.familyInvites = [...memberResults.flatMap(item => item.invites.map(invite => fromApiInvite(invite, item.familyId))),
+      ...incomingInvites.map(invite => fromApiInvite(invite, invite.family_id))]
+      .filter((invite, index, list) => list.findIndex(item => item.id === invite.id) === index);
+    incomingInvites.forEach(invite => {
+      const familyId = invite.family_id;
+      if (familyId && !db.families.some(family => family.id === familyId)) {
+        db.families.push({ id: familyId, name: invite.family_name || 'Gia đình', ownerEmail: invite.inviter_email || '',
+          role: '', monthlyBudget: 0 });
+      }
+    });
+    db.users = [...(isAdmin ? adminUsers.map(fromApiUser) : []), ...db.familyMembers.map(member => member.user),
+      fromApiUser(profile)].filter((user, index, list) => list.findIndex(item => item.id === user.id) === index);
+    db.tx = [...transactions.map(fromApiTransaction), ...transfers.map(fromApiTransfer)];
+    db.budgets = budgets.map(fromApiBudget);
+    const goalContributions = await Promise.all(goals.map(goal =>
+      responseList(`goals/${encodeURIComponent(goal.id)}/contributions`, 'contributions')));
+    db.goals = goals.map((goal, index) => fromApiGoal({ ...goal, contributions: goalContributions[index] }));
+    db.notifications = notifications.map(fromApiNotification);
+    db.familyFundEntries = [];
+    const accountAdjustments = await Promise.all(accounts.map(account =>
+      responseList(`accounts/${encodeURIComponent(account.id)}/adjustments`, 'adjustments')));
+    db.accountAdjustments = accountAdjustments.flat().map(fromApiAdjustment);
+    serverSnapshots.categories = new Map(db.cats.filter(item => item.owner === session.email || item.scope === 'family').map(item => [item.id, categoryBody(item)]));
+    serverSnapshots.categoryVisibility = new Map(db.cats.map(item => [item.id, item.hidden]));
+    serverSnapshots.accounts = new Map(db.accounts.map(item => [item.id, accountBody(item)]));
+    serverSnapshots.budgets = new Map(db.budgets.map(item => [item.id, budgetBody(item)]));
+    serverSnapshots.goals = new Map(db.goals.map(item => [item.id, goalBody(item)]));
+    serverSnapshots.families = new Map(db.families.map(item => [item.id, familyBody(item)]));
+    serverSnapshots.familyMembers = new Map(db.familyMembers.map(item => [`${item.familyId}:${item.userId}`, memberBody(item)]));
+    serverSnapshots.familyInvites = new Map(db.familyInvites.filter(item => ['OWNER', 'MANAGER'].includes(familyRoleOf(item.familyId))).map(item => [item.id, inviteBody(item)]));
+    serverSnapshots.notifications = new Map(db.notifications.map(item => [item.id, notificationBody(item)]));
+    serverSnapshots.users = new Map(db.users.map(item => [item.id, { role: item.role, status: item.status }]));
+    serverStateReady = true;
+    await importResult;
+    render();
+  }
+  async function reloadApiTransactions() {
+    const [transactions, transfers, accounts] = await Promise.all([
+      apiRequest('transactions?scope=all').then(result => result.transactions || []),
+      apiRequest('transfers').then(result => unwrapApi(result).transfers || []),
+      apiRequest('accounts').then(result => unwrapApi(result).accounts || [])
+    ]);
+    db.accounts = accounts.map(fromApiAccount);
+    db.tx = [...transactions.map(fromApiTransaction), ...transfers.map(fromApiTransfer)];
+    render();
+  }
+  async function sendApiTransaction(transaction, old) {
+    const updating = old?.apiSynced;
+    if (transaction.type === 'transfer') {
+      const result = await apiRequest(updating ? `transfers/${old.id}` : 'transfers', {
+        method: updating ? 'PATCH' : 'POST',
+        body: JSON.stringify({ from_account: transaction.accountId, to_account: transaction.toAccountId,
+          amount: transaction.amount, transfer_date: transaction.date, note: transaction.note })
+      });
+      return fromApiTransfer(unwrapApi(result).transfer);
+    }
+    const result = await apiRequest(updating ? `transactions/${old.id}` : 'transactions', {
+      method: updating ? 'PUT' : 'POST',
+      body: JSON.stringify({ account_id: transaction.accountId, category_id: transaction.catId,
+        type: transaction.type, amount: transaction.amount, transaction_date: transaction.date,
+        note: transaction.note, payment_method: transaction.paymentMethod || 'cash',
+        scope: transaction.scope, family_id: transaction.familyId || undefined })
+    });
+    return fromApiTransaction(unwrapApi(result).transaction);
+  }
+  function categoryBody(item) {
+    return { name: item.name, type: item.type, description: item.note || '', parent_id: item.parentId || null,
+      family_id: item.familyId || null };
+  }
+  function accountBody(item) {
+    return { name: item.name, type: item.type, opening_balance: Number(item.openingBalance || 0),
+      currency: item.currency || 'VND', family_id: item.familyId || null, is_active: !item.hidden };
+  }
+  function budgetBody(item) {
+    return { category_id: item.catId, month: `${item.month}-01`, amount: Number(item.amount), family_id: item.familyId || null };
+  }
+  function goalBody(item) {
+    return { name: item.name, target: Number(item.target), saved: Number(item.saved || 0), deadline: item.deadline || null,
+      family_id: item.familyId || null };
+  }
+  function familyBody(item) {
+    return { name: item.name, monthly_budget: Number(item.monthlyBudget || 0), settings: { description: item.description || '' } };
+  }
+  function memberBody(item) {
+    return { role: item.role, status: item.status, relationship: item.relationship || '', family_note: item.familyNote || '' };
+  }
+  function inviteBody(item) {
+    return { email: item.email, role: item.role || 'MEMBER' };
+  }
+  function notificationBody(item) {
+    return { is_read: !!item.readAt };
+  }
+  function setEntityFromApi(resource, item, row) {
+    const mapped = resource === 'categories' ? fromApiCategory(row) : resource === 'accounts' ? fromApiAccount(row)
+      : resource === 'budgets' ? fromApiBudget(row) : resource === 'goals' ? fromApiGoal(row) : fromApiFamily(row);
+    const oldId = item.id;
+    Object.assign(item, mapped);
+    remapServerId(resource, oldId, mapped.id);
+    return item;
+  }
+  async function persistServerResource(resource) {
+    if (resource === 'familyMembers') {
+      const snapshot = serverSnapshots.familyMembers || (serverSnapshots.familyMembers = new Map());
+      const current = new Map(db.familyMembers.map(item => [`${item.familyId}:${item.userId || item.userEmail}`, item]));
+      for (const [key, prior] of [...snapshot.entries()]) {
+        const member = current.get(key);
+        if (!member || member.status !== 'ACTIVE') {
+          const [familyId, userId] = key.split(':');
+          await apiRequest(`families/${encodeURIComponent(familyId)}/members/${encodeURIComponent(userId)}`, { method: 'DELETE' });
+          snapshot.delete(key);
+        } else if (prior.role !== member.role) {
+          const [familyId, userId] = key.split(':');
+          await apiRequest(`families/${encodeURIComponent(familyId)}/members/${encodeURIComponent(userId)}`, {
+            method: 'PATCH', body: JSON.stringify({ role: member.role, relationship: member.relationship || '', family_note: member.familyNote || '' })
+          });
+          snapshot.set(key, memberBody(member));
+        }
+      }
+      for (const [key, member] of current) {
+        if (!snapshot.has(key) && member.status === 'ACTIVE') throw new Error('Thành viên mới phải tham gia bằng lời mời do máy chủ cấp.');
+      }
+      return;
+    }
+    if (resource === 'familyInvites') {
+      const snapshot = serverSnapshots.familyInvites || (serverSnapshots.familyInvites = new Map());
+      const current = new Map(db.familyInvites.filter(item => item.status === 'PENDING'
+        && ['OWNER', 'MANAGER'].includes(familyRoleOf(item.familyId))).map(item => [item.id, item]));
+      for (const [id] of [...snapshot.entries()]) {
+        const invite = current.get(id);
+        if (!invite) {
+          const prior = db.familyInvites.find(item => item.id === id);
+          if (prior?.familyId) await apiRequest(`families/${encodeURIComponent(prior.familyId)}/invites/${encodeURIComponent(id)}`, { method: 'DELETE' });
+          snapshot.delete(id);
+        }
+      }
+      for (const [id, invite] of current) {
+        if (snapshot.has(id)) continue;
+        const response = unwrapApi(await apiRequest(`families/${encodeURIComponent(invite.familyId)}/invites`, {
+          method: 'POST', body: JSON.stringify(inviteBody(invite))
+        }));
+        const row = response.invite;
+        if (!row?.id) throw new Error('Máy chủ không trả về lời mời đã lưu.');
+        const oldId = invite.id;
+        invite.id = row.id; invite.token = row.token || '';
+        serverSnapshots.familyInvites.delete(oldId);
+        serverSnapshots.familyInvites.set(invite.id, inviteBody(invite));
+      }
+      return;
+    }
+    if (resource === 'notifications' || resource === 'users') return;
+    const config = {
+      categories: { rows: db.cats.filter(item => item.owner === session.email || item.scope === 'family'), path: 'categories', key: 'category', body: categoryBody },
+      accounts: { rows: db.accounts, path: 'accounts', key: 'account', body: accountBody },
+      budgets: { rows: db.budgets, path: 'budgets', key: 'budget', body: budgetBody },
+      goals: { rows: db.goals, path: 'goals', key: 'goal', body: goalBody },
+      families: { rows: db.families, path: 'families', key: 'family', body: familyBody }
+    }[resource];
+    if (!config) {
+      if (resource === 'users') return;
+      throw new Error(`Unsupported server resource: ${resource}`);
+    }
+    const snapshot = serverSnapshots[resource] || (serverSnapshots[resource] = new Map());
+    const current = new Map(config.rows.map(item => [item.id, item]));
+    for (const [id, prior] of [...snapshot.entries()]) {
+      if (current.has(id)) continue;
+      await apiRequest(`${config.path}/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      snapshot.delete(id);
+      if (resource === 'categories') serverSnapshots.categoryVisibility?.delete(id);
+      if (resource === 'families') {
+        for (const childType of ['accounts', 'budgets', 'goals']) {
+          const childSnapshot = serverSnapshots[childType];
+          if (!childSnapshot) continue;
+          for (const [childId, body] of childSnapshot) if (body.family_id === id) childSnapshot.delete(childId);
+        }
+      }
+    }
+    for (const [id, item] of current) {
+      const body = config.body(item);
+      const prior = snapshot.get(id);
+      if (!prior) {
+        const response = unwrapApi(await apiRequest(config.path, { method: 'POST', body: JSON.stringify(body) }));
+        const row = response[config.key];
+        if (!row?.id) throw new Error(`The ${resource} API did not return a database ID.`);
+        setEntityFromApi(resource, item, row);
+        snapshot.set(item.id, config.body(item));
+        if (resource === 'families' && item.role === 'OWNER' && session.userId) {
+          const owner = { id: session.userId, userId: session.userId, familyId: item.id, userEmail: session.email,
+            role: 'OWNER', status: 'ACTIVE', user: { id: session.userId, email: session.email, name: session.name, role: 'USER', status: 'ACTIVE' } };
+          db.familyMembers = db.familyMembers.filter(member => !(member.familyId === item.id && member.userEmail === session.email));
+          db.familyMembers.push(owner);
+          (serverSnapshots.familyMembers || (serverSnapshots.familyMembers = new Map())).set(`${item.id}:${session.userId}`, memberBody(owner));
+        }
+        if (resource === 'categories') serverSnapshots.categoryVisibility?.set(item.id, item.hidden);
+      } else if (JSON.stringify(prior) !== JSON.stringify(body)) {
+        const response = unwrapApi(await apiRequest(`${config.path}/${encodeURIComponent(id)}`, {
+          method: 'PATCH', body: JSON.stringify(body)
+        }));
+        const row = response[config.key];
+        if (!row?.id) throw new Error(`The ${resource} API returned an invalid record.`);
+        setEntityFromApi(resource, item, row);
+        snapshot.set(item.id, config.body(item));
+      }
+    }
+    if (resource === 'categories') {
+      const visibility = serverSnapshots.categoryVisibility || (serverSnapshots.categoryVisibility = new Map());
+      for (const item of config.rows) {
+        if (!visibility.has(item.id) || visibility.get(item.id) === item.hidden) continue;
+        const action = item.hidden ? 'hide' : 'restore';
+        const response = unwrapApi(await apiRequest(`categories/${encodeURIComponent(item.id)}/${action}`, { method: 'PATCH' }));
+        if (!response.category?.id) throw new Error('Máy chủ không xác nhận trạng thái danh mục.');
+        visibility.set(item.id, item.hidden);
+      }
+    }
+    render();
+  }
   const receiptData = receipt => {
     if (!receipt || typeof receipt.data !== 'string' || typeof receipt.type !== 'string') return '';
     const allowed = receipt.type === 'application/pdf' || /^image\/(jpeg|png|gif|webp|heic|heif)$/i.test(receipt.type);
@@ -369,10 +781,13 @@
   };
   const myGoals = () => db.goals.filter(g => g.owner === session.email);
   const goalSaved = goal => {
+    if (SERVER_MODE) return Number(goal.saved || 0);
     const savingsAccount = db.accounts.find(account => account.id === goal.accountId && account.goalId === goal.id);
     return savingsAccount ? accountBalance(savingsAccount) : Number(goal.saved || 0);
   };
-  const goalMovements = goal => goal.accountId ? db.tx.filter(transaction => transaction.owner === goal.owner
+  const goalMovements = goal => SERVER_MODE ? (goal.contributions || [])
+    .slice().sort((a, b) => (b.date || '').localeCompare(a.date || ''))
+    : goal.accountId ? db.tx.filter(transaction => transaction.owner === goal.owner
     && transaction.type === 'transfer' && [transaction.accountId, transaction.toAccountId].includes(goal.accountId))
     .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.createdAt || '').localeCompare(a.createdAt || '')) : [];
   const ensureGoalAccount = goal => {
@@ -952,7 +1367,7 @@
         <button type="button" class="sm dashboard-all-period" data-act="dm" data-id="all">Tất cả</button>
         <label class="dashboard-scope-select"><span>Phạm vi</span><select id="dashboardScope" data-live aria-label="Chọn phạm vi dashboard">${familyScopeOptions().map(([value, label]) => `<option value="${esc(value)}"${(S.dashboardScope || 'personal') === value ? ' selected' : ''}>${esc(label)}</option>`).join('')}</select></label>
         <label class="dashboard-scope-select"><span>Tài khoản</span><select id="dashboardAccount" data-live aria-label="Lọc theo ví hoặc tài khoản"><option value="">Tất cả tài khoản</option>${dashboardAccountOptions().map(([value, label]) => `<option value="${esc(value)}"${S.dashboardAccount === value ? ' selected' : ''}>${esc(label)}</option>`).join('')}</select></label>
-        <span class="dashboard-source">Dữ liệu trên thiết bị</span><button type="button" class="sm" data-act="refreshDash">${ic('s-refresh', 1)}Làm mới</button></div>
+        <span class="dashboard-source">${SERVER_MODE ? 'Thu/Chi cá nhân: PostgreSQL' : 'Dữ liệu trên thiết bị'}</span><button type="button" class="sm" data-act="refreshDash">${ic('s-refresh', 1)}Làm mới</button></div>
     </div><div id="dyn"></div>`;
   const h3 = 'style="margin:14px 0 8px;font-size:14px;color:var(--muted)"';
   const dashboardScopedTransactions = scope => db.tx.filter(t => scope === 'personal'
@@ -1393,8 +1808,11 @@
   const familyInviteInbox = () => {
     const invites = familyInvitesToMe();
     if (!invites.length) return '';
-    return `<section class="family-invite-inbox"><div><span class="dashboard-eyebrow">LỜI MỜI</span><h3>Bạn được mời tham gia gia đình</h3></div>${invites.map(invite => { const family = familyOf(invite.familyId); return family ? `<article class="family-invite-card"><div><strong>${esc(family.name)}</strong><small>${esc(uname(invite.inviterEmail))} đã mời bạn · ${formatTimestamp(invite.createdAt)}</small></div><div class="family-inline-actions"><button type="button" class="sm" data-act="acceptFamilyInvite" data-id="${esc(invite.id)}">Chấp nhận</button><button type="button" class="sm red" data-act="rejectFamilyInvite" data-id="${esc(invite.id)}">Từ chối</button></div></article>` : ''; }).join('')}</section>`;
+    return `<section class="family-invite-inbox"><div><span class="dashboard-eyebrow">LỜI MỜI</span><h3>Bạn được mời tham gia gia đình</h3></div>${invites.map(invite => { const family = familyOf(invite.familyId); return family ? `<article class="family-invite-card"><div><strong>${esc(family.name)}</strong><small>${esc(invite.inviterName || uname(invite.inviterEmail))} đã mời bạn · ${formatTimestamp(invite.createdAt)}</small></div><div class="family-inline-actions"><button type="button" class="sm" data-act="acceptFamilyInvite" data-id="${esc(invite.id)}">Chấp nhận</button><button type="button" class="sm red" data-act="rejectFamilyInvite" data-id="${esc(invite.id)}">Từ chối</button></div></article>` : ''; }).join('')}</section>`;
   };
+  const familyCodeInfo = family => SERVER_MODE
+    ? `<div class="family-code-row"><label>Tham gia</label><div class="family-code-box">Bằng lời mời trong hệ thống</div></div>`
+    : `<div class="family-code-row"><label>Mã gia đình</label><div class="family-code-box">${esc(family.code || '')}</div><button type="button" class="btn-ghost-d" data-act="copyFamilyCode">Sao chép mã</button></div>`;
   const familyReportTab = familyId => {
     const { transactions, byCategory } = familySummaryData(familyId);
     const income = transactions.filter(t => t.type === 'in').reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
@@ -1410,18 +1828,18 @@
   const familySettingsTab = familyId => {
     const family = familyOf(familyId);
     if (!family) return '<div class="chart-empty">Chưa có gia đình</div>';
-    if (family.ownerEmail !== session.email) return `<div class="family-settings-form"><h3>Cài đặt gia đình</h3><p>Chỉ chủ gia đình mới có thể thay đổi thông tin hoặc giải tán gia đình.</p><div class="family-code-row"><label>Mã gia đình</label><div class="family-code-box">${esc(family.code || 'FAM-000000')}</div><button type="button" class="btn-ghost-d" data-act="copyFamilyCode">Sao chép mã</button></div></div>`;
+    if (family.ownerEmail !== session.email) return `<div class="family-settings-form"><h3>Cài đặt gia đình</h3><p>Chỉ chủ gia đình mới có thể thay đổi thông tin hoặc giải tán gia đình.</p>${familyCodeInfo(family)}</div>`;
     return `<form class="family-settings-form" data-f="familySettings" novalidate>
       <div class="grid2">${field('familyName', 'Tên gia đình', 'i-users', { val: family.name })}${field('familyBudget', 'Ngân sách tháng', 'i-coins', { type: 'number', val: family.monthlyBudget || 0, attr: 'min="0" step="1000"' })}</div>
       ${field('familyDescription', 'Mô tả', 'i-receipt', { tag: 'textarea', val: family.description || '' })}
-      <div class="family-code-row"><label>Mã gia đình</label><div class="family-code-box">${esc(family.code || 'FAM-000000')}</div><button type="button" class="btn-ghost-d" data-act="copyFamilyCode">Sao chép mã</button></div>
+      ${familyCodeInfo(family)}
       <div class="actions"><button type="submit" class="btn-primary">Lưu thay đổi</button><button type="button" class="btn-danger" data-act="deleteFamily">Giải tán gia đình</button></div>
     </form>`;
   };
   const familyPage = () => {
     const memberships = myFamilyMemberships();
     if (!memberships.length) {
-      return `${familyInviteInbox()}<div class="family-empty card"><div class="family-empty-title">👨‍👩‍👧‍👦 Quản lý chi tiêu gia đình</div><p>Quản lý các khoản chi tiêu chung của gia đình cùng các thành viên.</p><div class="family-empty-actions"><button type="button" class="btn-primary" data-act="createFamily">${ic('s-plus', 1)}Tạo gia đình</button><button type="button" class="btn-ghost-d" data-act="joinFamily">Tham gia bằng mã</button></div><div class="family-empty-why"><h3>Tại sao nên tạo gia đình?</h3><ul><li>• Theo dõi chi tiêu chung</li><li>• Quản lý ngân sách gia đình</li><li>• Theo dõi chi tiêu từng thành viên</li><li>• Xem báo cáo tài chính gia đình</li></ul></div></div>`;
+      return `${familyInviteInbox()}<div class="family-empty card"><div class="family-empty-title">👨‍👩‍👧‍👦 Quản lý chi tiêu gia đình</div><p>Quản lý các khoản chi tiêu chung của gia đình cùng các thành viên.</p><div class="family-empty-actions"><button type="button" class="btn-primary" data-act="createFamily">${ic('s-plus', 1)}Tạo gia đình</button>${SERVER_MODE ? '' : '<button type="button" class="btn-ghost-d" data-act="joinFamily">Tham gia bằng mã</button>'}</div>${SERVER_MODE ? '<p class="family-form-hint">Nếu được mời, hãy chấp nhận lời mời trong khung phía trên.</p>' : ''}<div class="family-empty-why"><h3>Tại sao nên tạo gia đình?</h3><ul><li>• Theo dõi chi tiêu chung</li><li>• Quản lý ngân sách gia đình</li><li>• Theo dõi chi tiêu từng thành viên</li><li>• Xem báo cáo tài chính gia đình</li></ul></div></div>`;
     }
     const familyId = activeFamilyId();
     const family = familyOf(familyId);
@@ -1445,7 +1863,7 @@
         ${memberships.length > 1 ? `<label class="family-selector-label">Không gian<select id="familySelector" class="family-filter" data-live>${opt(memberships.map(member => [member.familyId, familyOf(member.familyId)?.name || 'Gia đình']), familyId)}</select></label>` : ''}
         <div class="family-header-meta">
           <div><span>Chủ gia đình</span><strong>${esc(findUser(family.ownerEmail)?.name || family.ownerEmail)}</strong></div>
-          <div><span>Mã gia đình</span><strong>${esc(family.code || 'FAM-000000')}</strong></div>
+          <div><span>${SERVER_MODE ? 'Tham gia' : 'Mã gia đình'}</span><strong>${SERVER_MODE ? 'Bằng lời mời' : esc(family.code || '')}</strong></div>
         </div>
         <button type="button" class="btn-primary" data-act="addFamilyTransaction">${ic('s-plus', 1)}Thêm giao dịch</button>
       </div>
@@ -1470,7 +1888,7 @@
         return `<article class="progress-item"><div class="card-head"><div><h3>${esc(g.name)}</h3><small>${g.deadline ? `Hoàn thành trước ${fdate(g.deadline)}` : 'Chưa đặt ngày hoàn thành'} · <span class="badge ${done ? 'ok' : ''}">${done ? 'Đã hoàn thành' : `${pct}% mục tiêu`}</span></small></div><div class="cell-act"><button class="sm" data-act="contributeGoal" data-id="${esc(g.id)}">${ic('s-plus', 1)}Đóng góp</button><button class="sm" data-act="withdrawGoal" data-id="${esc(g.id)}">Rút tiền</button><button class="sm" data-act="editGoal" data-id="${esc(g.id)}">${ic('i-pen-to-square')}Sửa</button><button class="sm red" data-act="delGoal" data-id="${esc(g.id)}">${ic('s-trash', 1)}Xóa</button></div></div>
           ${progressBar(saved, g.target, done ? 'ok' : '')}<div class="progress-caption"><b>${money(saved)}</b><span>${pct}%</span><span>Mục tiêu ${money(g.target)}</span></div>${g.note ? `<p class="goal-note">${esc(g.note)}</p>` : ''}
           ${movements.length ? `<div class="goal-movements"><strong>Đóng góp / rút tiền gần đây</strong>${movements.map(transaction => {
-            const deposit = transaction.toAccountId === g.accountId;
+            const deposit = SERVER_MODE ? transaction.eventType !== 'WITHDRAWAL' : transaction.toAccountId === g.accountId;
             return `<div><span>${deposit ? 'Đóng góp' : 'Rút tiền'} · ${fdate(transaction.date)}${transaction.note ? ` · ${esc(transaction.note)}` : ''}</span><b class="${deposit ? 'inc' : 'exp'}">${deposit ? '+' : '−'}${money(transaction.amount)}</b></div>`;
           }).join('')}</div>` : ''}</article>`;
       }).join('')}</div>` : `<div class="chart-empty">Chưa có mục tiêu tiết kiệm.</div>`}</div>`;
@@ -1588,7 +2006,7 @@
         ? `<div id="txFamilyFields"${formScope === 'family' ? '' : ' hidden'}>${field('familyId', 'Gia đình', 'i-users', { tag: 'select', opts: opt(familyOptions, formFamilyId, 'Chọn gia đình') })}</div>`
         : '';
       return `<form class="card tx-form-card" data-f="tx" novalidate>
-        <div class="tx-form-heading"><div><span class="dashboard-eyebrow">${editing?.scope === 'family' ? 'CẬP NHẬT GIAO DỊCH DÙNG CHUNG' : editing ? 'CẬP NHẬT SỔ THU CHI' : 'GHI NHẬN DÒNG TIỀN'}</span><h2 class="card-title">${editing ? 'SỬA GIAO DỊCH' : 'THÊM GIAO DỊCH'}</h2></div><span class="tx-secure-tag">${ic('i-shield-halved')} ${editing?.scope === 'family' ? 'Chia sẻ có kiểm soát' : 'Lưu riêng tư'}</span></div>
+        <div class="tx-form-heading"><div><span class="dashboard-eyebrow">${editing?.scope === 'family' ? 'CẬP NHẬT GIAO DỊCH DÙNG CHUNG' : editing ? 'CẬP NHẬT SỔ THU CHI' : 'GHI NHẬN DÒNG TIỀN'}</span><h2 class="card-title">${editing ? 'SỬA GIAO DỊCH' : 'THÊM GIAO DỊCH'}</h2></div><span class="tx-secure-tag">${ic('i-shield-halved')} ${SERVER_MODE ? 'Lưu PostgreSQL (cá nhân)' : editing?.scope === 'family' ? 'Chia sẻ có kiểm soát' : 'Lưu riêng tư'}</span></div>
         <div class="grid2">${field('type', 'Loại giao dịch', 's-swap', { tag: 'select', opts: opt(TRANSACTION_TYPES, e.type || 'out') })}
           <div class="amount-entry">${field('amount', 'Số tiền (₫)', 'i-coins', { type: 'number', val: e.amount, attr: 'min="0.01" step="any" inputmode="decimal"' })}
             <div class="amount-presets" role="group" aria-label="Mức tiền nhập nhanh"><span>Nhập nhanh</span><button type="button" class="sm" data-act="amountPreset" data-id="10000">10.000 ₫</button><button type="button" class="sm" data-act="amountPreset" data-id="100000">100.000 ₫</button></div></div>
@@ -1661,8 +2079,10 @@
   $('#uname').textContent = session.name;
   function render() {
     sync();
-    syncRecurringTransactions();
-    syncBudgetNotifications();
+    if (!SERVER_MODE) {
+      syncRecurringTransactions();
+      syncBudgetNotifications();
+    }
     const p = PAGES[page];
     $('#title').textContent = p.t; document.title = 'Expense Tracker — ' + p.t;
     document.querySelectorAll('.nav[data-p]').forEach(b => b.classList.toggle('on', b.dataset.p === page));
@@ -1828,6 +2248,21 @@
       const invite = db.familyInvites.find(item => item.id === id && item.status === 'PENDING' && (item.email || '').toLowerCase() === session.email.toLowerCase());
       const family = invite && familyOf(invite.familyId);
       if (!invite || !family) return toast('Lời mời không hợp lệ hoặc đã hết hạn');
+      if (SERVER_MODE) {
+        (async () => {
+          try {
+            const response = unwrapApi(await apiRequest(`families/invites/${encodeURIComponent(id)}/accept`, { method: 'POST' }));
+            S.familyId = response.family?.id || invite.familyId;
+            S.familyTab = 'overview';
+            await loadServerWorkspace();
+            toast(`Bạn đã tham gia ${response.family?.name || family.name}`);
+          } catch (error) {
+            console.error('Unable to accept family invitation', error);
+            toast(`Không thể chấp nhận lời mời: ${error.message}`, 5500);
+          }
+        })();
+        return;
+      }
       const existing = db.familyMembers.find(member => member.familyId === family.id && member.userEmail === session.email);
       if (existing?.status === 'ACTIVE') return toast('Bạn đã là thành viên của gia đình này');
       if (existing) {
@@ -1845,6 +2280,19 @@
     rejectFamilyInvite: id => {
       const invite = db.familyInvites.find(item => item.id === id && item.status === 'PENDING' && (item.email || '').toLowerCase() === session.email.toLowerCase());
       if (!invite) return toast('Lời mời không hợp lệ hoặc đã hết hạn');
+      if (SERVER_MODE) {
+        (async () => {
+          try {
+            await apiRequest(`families/invites/${encodeURIComponent(id)}/decline`, { method: 'POST' });
+            await loadServerWorkspace();
+            toast('Đã từ chối lời mời');
+          } catch (error) {
+            console.error('Unable to decline family invitation', error);
+            toast(`Không thể từ chối lời mời: ${error.message}`, 5500);
+          }
+        })();
+        return;
+      }
       invite.status = 'REJECTED'; invite.respondedAt = new Date().toISOString();
       saveFamilyInvites();
       recordNotification(invite.inviterEmail, `family-invite:${invite.id}:rejected`, 'invite', 'Lời mời gia đình bị từ chối',
@@ -1968,6 +2416,7 @@
       openDlg(`<h2 style="color:var(--blue-900);margin-bottom:14px">Tạo gia đình</h2>${field('familyName', 'Tên gia đình *', 'i-users')}${field('familyDescription', 'Mô tả', 'i-receipt', { tag: 'textarea', attr: 'maxlength="500"' })}<div class="grid2">${field('familyMonthlyBudget', 'Ngân sách tháng', 'i-coins', { type: 'number', val: 0, attr: 'min="0" step="1000"' })}${field('familyCycleDay', 'Ngày bắt đầu chu kỳ ngân sách', 's-cal', { type: 'number', val: 1, attr: 'min="1" max="31"' })}</div><div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">HỦY</button><button class="btn-primary" value="ok">Tạo gia đình</button></div>`);
     },
     joinFamily: () => {
+      if (SERVER_MODE) return toast('Phiên bản PostgreSQL chỉ cho phép tham gia bằng lời mời. Hãy chấp nhận lời mời trong mục Gia đình.');
       dform.onsubmit = e => {
         if (e.submitter?.value !== 'ok') return;
         e.preventDefault();
@@ -2016,7 +2465,7 @@
           `Lời mời tham gia ${family.name} đã được gửi đến ${email}.`, family.id);
         dlg.close(); render(); toast('Mời thành viên đã được gửi.');
       };
-      openDlg(`<h2 style="color:var(--blue-900);margin-bottom:14px">Mời thành viên</h2>${field('inviteEmail', 'Email', 'i-envelope', { type: 'email' })}${field('inviteRelationship', 'Quan hệ với gia đình', 'i-users', { tag: 'select', opts: opt(FAMILY_RELATIONS.filter(([key]) => key).map(([key, label]) => [key, label]), '', 'Cập nhật sau khi tham gia') })}<div class="family-code-row"><label>Mã gia đình</label><div class="family-code-box">${esc(family.code || 'FAM-000000')}</div><button type="button" class="btn-ghost-d" data-act="copyFamilyCode">Sao chép mã</button></div><div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">HỦY</button><button class="btn-primary" value="ok">Gửi lời mời</button></div>`);
+      openDlg(`<h2 style="color:var(--blue-900);margin-bottom:14px">Mời thành viên</h2>${field('inviteEmail', 'Email', 'i-envelope', { type: 'email' })}${field('inviteRelationship', 'Quan hệ với gia đình', 'i-users', { tag: 'select', opts: opt(FAMILY_RELATIONS.filter(([key]) => key).map(([key, label]) => [key, label]), '', 'Cập nhật sau khi tham gia') })}${SERVER_MODE ? '<p class="family-form-hint">Lời mời được gửi tới email tài khoản. Người nhận chấp nhận trong mục Gia đình.</p>' : `<div class="family-code-row"><label>Mã gia đình</label><div class="family-code-box">${esc(family.code || '')}</div><button type="button" class="btn-ghost-d" data-act="copyFamilyCode">Sao chép mã</button></div>`}<div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">HỦY</button><button class="btn-primary" value="ok">Gửi lời mời</button></div>`);
     },
     cancelFamilyInvite: id => {
       const family = activeFamily(), invite = db.familyInvites.find(item => item.id === id && item.familyId === family?.id && item.status === 'PENDING');
@@ -2079,11 +2528,27 @@
         </dl><div class="actions">${!isAdmin && canEditFamilyTransaction(t) ? `<button type="button" class="sm" data-act="editTxDetail" data-id="${esc(t.id)}">${ic('i-pen-to-square')}Sửa</button>` : ''}<button type="button" class="btn-ghost-d" data-act="closeDlg">ĐÓNG</button></div>`, true); },
     editTxDetail: id => { dlg.close(); ACT.editTx(id); },
     delTx: id => { const t = db.tx.find(x => x.id === id); if (!t || (!isAdmin && !canDeleteFamilyTransaction(t))) return toast('Bạn không có quyền xóa giao dịch này');
-      confirmDeleteTx(t, () => deleteTransactionsWithUndo([t])); },   // TODO: DELETE /api/transactions/:id
+      confirmDeleteTx(t, async () => {
+        if (SERVER_MODE) {
+          try { await apiRequest(`${t.type === 'transfer' ? 'transfers' : 'transactions'}/${encodeURIComponent(t.id)}`, { method: 'DELETE' }); }
+          catch (error) { toast('Chưa xóa ở PostgreSQL: ' + error.message, 5500); return; }
+          db.tx = db.tx.filter(item => item.id !== t.id); saveTx(); render(); toast('Đã xóa giao dịch trong PostgreSQL'); return;
+        }
+        deleteTransactionsWithUndo([t]);
+      }); },
     selTx: id => { const s = S.sel = S.sel || []; const i = s.indexOf(id); i < 0 ? s.push(id) : s.splice(i, 1); refreshRows(); },
     selAll: () => { const s = S.sel = S.sel || [], every = PAGE_IDS.every(id => s.includes(id)); S.sel = every ? s.filter(id => !PAGE_IDS.includes(id)) : [...new Set([...s, ...PAGE_IDS])]; refreshRows(); },
     bulk: () => { const selected = (S.sel || []).map(id => db.tx.find(transaction => transaction.id === id && transaction.owner === session.email)).filter(Boolean); if (!selected.length) return;
-      confirmBox(`Xóa ${selected.length} giao dịch đã chọn?`, () => { S.sel = []; deleteTransactionsWithUndo(selected); }); },
+      confirmBox(`Xóa ${selected.length} giao dịch đã chọn?`, async () => {
+        if (SERVER_MODE) {
+          try {
+            for (const transaction of selected) await apiRequest(`${transaction.type === 'transfer' ? 'transfers' : 'transactions'}/${encodeURIComponent(transaction.id)}`, { method: 'DELETE' });
+            await reloadApiTransactions(); S.sel = []; toast('Đã xóa các giao dịch trong PostgreSQL');
+          } catch (error) { await reloadApiTransactions().catch(() => {}); toast('Lỗi đồng bộ: ' + error.message, 5500); }
+          return;
+        }
+        S.sel = []; deleteTransactionsWithUndo(selected);
+      }); },
     sort: k => { const cur = S.sk || 'date', dir = S.sd || 'desc'; S.sd = k === cur ? (dir === 'desc' ? 'asc' : 'desc') : 'desc'; S.sk = k; S.pg = 1;
       document.querySelectorAll('th[data-act="sort"]').forEach(th => { th.textContent = th.dataset.l + arrow(th.dataset.id); }); refreshRows(); },
     pg: n => { S.pg = Math.max(1, Math.min(PG.pages, Number(n))); refreshRows(); },
@@ -2144,14 +2609,14 @@
     goalMovement: (id, type) => {
       const goal = myGoals().find(item => item.id === id);
       if (!goal) return toast('Không tìm thấy mục tiêu tiết kiệm');
-      if (!ensureGoalAccount(goal)) return;
+      if (!SERVER_MODE && !ensureGoalAccount(goal)) return;
       const accounts = myAccounts();
-      if (!accounts.length) return toast('Bạn cần có ít nhất một ví cá nhân để đóng góp hoặc rút tiền');
+      if (!SERVER_MODE && !accounts.length) return toast('Bạn cần có ít nhất một ví cá nhân để đóng góp hoặc rút tiền');
       dform.dataset.f = 'goalMovement'; dform.onsubmit = null;
       dform.innerHTML = `<h2 class="card-title">${type === 'deposit' ? 'ĐÓNG GÓP VÀO MỤC TIÊU' : 'RÚT TIỀN TỪ MỤC TIÊU'}</h2>
         <p class="goal-movement-balance"><strong>${esc(goal.name)}</strong><span>Số dư hiện tại: ${money(goalSaved(goal))}</span></p>
         ${field('goalMovementAmount', 'Số tiền (₫)', 'i-coins', { type: 'number', attr: 'min="0.01" step="any"' })}
-        ${field('goalMovementAccount', type === 'deposit' ? 'Chuyển từ ví' : 'Chuyển vào ví', 'i-wallet', { tag: 'select', opts: opt(accounts.map(account => [account.id, account.name]), '', 'Chọn ví cá nhân') })}
+        ${SERVER_MODE ? '' : field('goalMovementAccount', type === 'deposit' ? 'Chuyển từ ví' : 'Chuyển vào ví', 'i-wallet', { tag: 'select', opts: opt(accounts.map(account => [account.id, account.name]), '', 'Chọn ví cá nhân') })}
         ${field('goalMovementNote', 'Ghi chú', 'i-receipt', { tag: 'textarea', attr: 'maxlength="240"' })}
         <input type="hidden" name="goalMovementType" value="${type}"><input type="hidden" name="goalMovementGoalId" value="${esc(goal.id)}">
         <div class="actions"><button type="button" class="btn-ghost-d" data-act="closeDlg">HỦY</button><button class="btn-primary">${type === 'deposit' ? 'ĐÓNG GÓP' : 'RÚT TIỀN'}</button></div>`;
@@ -2321,14 +2786,18 @@
       if (editing) Object.assign(editing, value);
       else {
         goal = { id: uid(), owner: session.email, saved, ...value };
-        const savingsAccount = { id: uid(), owner: session.email, goalId: goal.id, name: `Tiết kiệm · ${name}`,
-          type: 'bank', openingBalance: saved, scope: 'personal', hidden: true, note: 'Ví nội bộ của mục tiêu tiết kiệm',
-          createdAt: new Date().toISOString() };
-        goal.accountId = savingsAccount.id;
-        db.goals = [...db.goals, goal]; db.accounts = [...db.accounts, savingsAccount];
+        if (SERVER_MODE) goal.contributions = [];
+        else {
+          const savingsAccount = { id: uid(), owner: session.email, goalId: goal.id, name: `Tiết kiệm · ${name}`,
+            type: 'bank', openingBalance: saved, scope: 'personal', hidden: true, note: 'Ví nội bộ của mục tiêu tiết kiệm',
+            createdAt: new Date().toISOString() };
+          goal.accountId = savingsAccount.id;
+          db.accounts = [...db.accounts, savingsAccount];
+        }
+        db.goals = [...db.goals, goal];
       }
       try {
-        saveAccounts();
+        if (!SERVER_MODE) saveAccounts();
         saveGoals();
       } catch (error) {
         db.goals = previousGoals; db.accounts = previousAccounts;
@@ -2338,19 +2807,36 @@
       }
       delete S.editGoal; render(); toast(editing ? 'Đã cập nhật mục tiêu' : 'Đã tạo mục tiêu');
     },
-    goalMovement: (f, d) => {
+    goalMovement: async (f, d) => {
       const goal = myGoals().find(item => item.id === d.goalMovementGoalId);
       const type = d.goalMovementType, amount = Number(d.goalMovementAmount);
       const wallet = myAccounts().find(account => account.id === d.goalMovementAccount);
       const savingsAccount = goal && db.accounts.find(account => account.id === goal.accountId && account.goalId === goal.id);
       const errors = {};
-      if (!goal || !savingsAccount) return toast('Mục tiêu hoặc ví tiết kiệm không còn hợp lệ');
+      if (!goal || (!SERVER_MODE && !savingsAccount)) return toast('Mục tiêu hoặc ví tiết kiệm không còn hợp lệ');
       if (!['deposit', 'withdraw'].includes(type)) errors.goalMovementType = 'Chọn thao tác hợp lệ';
       if (!Number.isFinite(amount) || amount <= 0 || amount > 999999999999) errors.goalMovementAmount = 'Nhập số tiền lớn hơn 0 và hợp lệ';
-      if (!wallet || !accountCanUse(wallet) || accountIsFamily(wallet)) errors.goalMovementAccount = 'Chọn ví cá nhân hợp lệ';
+      if (!SERVER_MODE && (!wallet || !accountCanUse(wallet) || accountIsFamily(wallet))) errors.goalMovementAccount = 'Chọn ví cá nhân hợp lệ';
       if (type === 'withdraw' && Number.isFinite(amount) && amount > goalSaved(goal)) errors.goalMovementAmount = 'Số tiền rút vượt quá số dư mục tiêu';
       if ((d.goalMovementNote || '').length > 240) errors.goalMovementNote = 'Ghi chú tối đa 240 ký tự';
       if (!showErr(f, errors)) return;
+      if (SERVER_MODE) {
+        try {
+          const action = type === 'deposit' ? 'contributions' : 'withdrawals';
+          const response = unwrapApi(await apiRequest(`goals/${encodeURIComponent(goal.id)}/${action}`, {
+            method: 'POST', body: JSON.stringify({ amount, contribution_date: today(), note: (d.goalMovementNote || '').trim() })
+          }));
+          Object.assign(goal, fromApiGoal({ ...goal, ...response.goal }));
+          const entry = response.contribution || response.withdrawal;
+          if (entry) goal.contributions = [...(goal.contributions || []), {
+            id: entry.id, amount: asMoney(entry.amount), date: dateOnly(entry.event_date || entry.contribution_date),
+            note: entry.note || '', eventType: entry.event_type || (type === 'deposit' ? 'DEPOSIT' : 'WITHDRAWAL')
+          }];
+          serverSnapshots.goals.set(goal.id, goalBody(goal));
+          dlg.close(); render(); toast(type === 'deposit' ? 'Đã đóng góp vào mục tiêu' : 'Đã rút tiền khỏi mục tiêu');
+        } catch (error) { toast('Không thể cập nhật mục tiêu: ' + error.message, 5500); }
+        return;
+      }
       const transaction = { id: uid(), owner: session.email, type: 'transfer', amount, date: today(),
         accountId: type === 'deposit' ? wallet.id : savingsAccount.id,
         toAccountId: type === 'deposit' ? savingsAccount.id : wallet.id,
@@ -2403,6 +2889,10 @@
       if (d.recurrence && !['none', 'monthly'].includes(d.recurrence)) errors.recurrence = 'Chọn chu kỳ hợp lệ';
       if (transfer && d.recurrence === 'monthly') errors.recurrence = 'Chuyển ví không hỗ trợ lặp định kỳ';
       if (!showErr(f, errors)) return;
+      if (SERVER_MODE && (d.recurrence === 'monthly' || receiptFile)) {
+        toast('Chế độ PostgreSQL chưa lưu giao dịch định kỳ hoặc chứng từ; hãy bỏ các mục này rồi lưu lại.', 5500);
+        return;
+      }
       if (editingTransaction?.scope === 'family' && (scope !== 'family' || familyId !== editingTransaction.familyId)) return toast('Giao dịch dùng chung phải được giữ trong gia đình hiện tại');
       const editing = S.editTx && db.tx.find(transaction => transaction.id === S.editTx);
       if (S.editTx && (!editing || (!isAdmin && !canEditFamilyTransaction(editing)))) {
@@ -2440,16 +2930,25 @@
         if (scope !== 'family') delete transaction.familyId;
       } else delete transaction.toAccountId;
       if (!old) transaction.createdAt = now;
+      if (SERVER_MODE) {
+        try { Object.assign(transaction, await sendApiTransaction(transaction, old)); }
+        catch (error) { toast('PostgreSQL chưa lưu: ' + error.message, 6500); return; }
+      }
       const nextTransactions = old
         ? db.tx.map(item => item.id === old.id ? transaction : item)
         : [...db.tx, transaction];
-      try {
+      if (SERVER_MODE) db.tx = nextTransactions;
+      else try {
         write(TX_KEY, nextTransactions);
         db.tx = nextTransactions;
       } catch (error) {
         console.error('Unable to save transaction', error);
         toast('Không thể lưu giao dịch. Hãy giảm dung lượng chứng từ hoặc kiểm tra bộ nhớ trình duyệt.', 4500);
         return;
+      }
+      if (SERVER_MODE) {
+        try { await reloadApiTransactions(); }
+        catch (error) { toast('Đã lưu nhưng không thể làm mới số dư: ' + error.message, 5000); }
       }
       delete S.editTx; delete S.copyTx; render(); toast(old ? 'Đã cập nhật giao dịch' : 'Đã lưu giao dịch thành công');
     },
@@ -2693,4 +3192,8 @@
   });
   $('#menuBtn').onclick = () => $('#side').classList.toggle('open');
   render();
+  if (SERVER_MODE) loadServerWorkspace().catch(error => {
+    console.error('Unable to load PostgreSQL workspace', error);
+    toast('Không tải được dữ liệu PostgreSQL: ' + error.message, 6500);
+  });
 })();

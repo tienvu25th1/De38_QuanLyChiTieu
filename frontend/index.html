@@ -886,6 +886,16 @@
  
       /* ---------- Tài khoản: lưu ở localStorage (thay bằng gọi API khi có Backend) ---------- */
       const USERS_KEY = 'et_users', SESSION_KEY = 'et_session';
+      // Run through Nginx 8080 to use the PostgreSQL-backed demo; Live Server stays offline/local.
+      const SERVER_MODE = location.port === '8080';
+      async function backendAuth(path, data) {
+        const response = await fetch('/api/auth/' + path, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data)
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.message || 'Không kết nối được API (' + response.status + ')');
+        return body;
+      }
       const loadUsers = () => { try { return JSON.parse(localStorage.getItem(USERS_KEY)) || []; } catch (_) { return []; } };
       const saveUsers = list => localStorage.setItem(USERS_KEY, JSON.stringify(list));
       async function hashPw(pw) {
@@ -906,6 +916,7 @@
 
       // Tài khoản quản trị mặc định (tạo 1 lần nếu chưa có admin): admin@admin.com / Admin@123
       (async () => {
+        if (SERVER_MODE) return;
         const list = loadUsers();
         if (!list.some(u => u.role === 'ADMIN')) {
           list.push({ name: 'Quản trị viên', username: 'admin', email: 'admin@admin.com',
@@ -917,6 +928,18 @@
       async function doLogin(form) {
         const emailIn = form.querySelector('[name="email"]'), passIn = form.querySelector('[name="password"]');
         const email = emailIn.value.trim().toLowerCase();
+        if (SERVER_MODE) {
+          try {
+            const data = await backendAuth('login', { email, password: passIn.value });
+            const user = { name: data.user.full_name, username: data.user.username, email: data.user.email,
+              role: data.user.role, status: data.user.status, id: data.user.id };
+            const all = loadUsers().filter(u => u.email !== user.email);
+            all.push(user); saveUsers(all);
+            sessionStorage.setItem('et_api_token', data.token); // no token saved into localStorage
+            localStorage.setItem(SESSION_KEY, JSON.stringify({ ...user, backend: true }));
+            return { user };
+          } catch (error) { return { input: passIn, error: error.message }; }
+        }
         const user = loadUsers().find(u => u.email === email);
         if (!user) return { input: emailIn, error: 'Email chưa được đăng ký' };
         if (user.passwordHash !== await hashPw(passIn.value)) return { input: passIn, error: 'Mật khẩu không đúng' };
@@ -930,6 +953,14 @@
       async function doSignup(form) {
         const q = n => form.querySelector('[name="' + n + '"]');
         const email = q('email').value.trim().toLowerCase(), username = q('username').value.trim();
+        if (SERVER_MODE) {
+          try {
+            const data = await backendAuth('register', {
+              username, full_name: q('name').value.trim(), email, password: q('password').value
+            });
+            return { user: { email: data.user.email } };
+          } catch (error) { return { input: q('email'), error: error.message }; }
+        }
         const list = loadUsers();
         if (list.some(u => u.email === email)) return { input: q('email'), error: 'Email này đã được đăng ký' };
         if (list.some(u => u.username.toLowerCase() === username.toLowerCase())) return { input: q('username'), error: 'Tên đăng nhập đã tồn tại' };

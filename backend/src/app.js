@@ -5,6 +5,7 @@ const client = require('prom-client');
 const authRoutes = require('./routes/auth.routes');
 const transactionRoutes = require('./routes/transaction.routes');
 const dashboardRoutes = require('./routes/dashboard.routes');
+const featureRoutes = require('./routes/features.routes');
 const {
   notFound,
   errorHandler
@@ -112,6 +113,16 @@ app.use((req, res, next) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/transactions', transactionRoutes);
 app.use('/api/dashboard', dashboardRoutes);
+app.use('/api/categories', featureRoutes.categories);
+app.use('/api/accounts', featureRoutes.accounts);
+app.use('/api/transfers', featureRoutes.transfers);
+app.use('/api/budgets', featureRoutes.budgets);
+app.use('/api/goals', featureRoutes.goals);
+app.use('/api/families', featureRoutes.families);
+app.use('/api/notifications', featureRoutes.notifications);
+app.use('/api/profile', featureRoutes.profile);
+app.use('/api/admin', featureRoutes.admin);
+app.use('/api/import', featureRoutes.imports);
 
 // ========================================
 // 7. API KIEM TRA BACKEND
