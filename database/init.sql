@@ -17,6 +17,8 @@ CREATE TABLE users (
 CREATE TABLE families (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(150) NOT NULL,
+    monthly_budget NUMERIC(14, 2) CHECK (monthly_budget IS NULL OR monthly_budget >= 0),
+    settings JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_by UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -41,7 +43,7 @@ CREATE TABLE family_invites (
         CHECK (role IN ('MANAGER', 'MEMBER', 'CHILD')),
     token_hash TEXT NOT NULL UNIQUE,
     status VARCHAR(10) NOT NULL DEFAULT 'PENDING'
-        CHECK (status IN ('PENDING', 'ACCEPTED', 'EXPIRED', 'REVOKED')),
+        CHECK (status IN ('PENDING', 'ACCEPTED', 'DECLINED', 'EXPIRED', 'REVOKED')),
     expires_at TIMESTAMPTZ NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -55,6 +57,9 @@ CREATE TABLE categories (
     type VARCHAR(3) NOT NULL CHECK (type IN ('in', 'out')),
     description TEXT NOT NULL DEFAULT '',
     user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    family_id UUID REFERENCES families(id) ON DELETE CASCADE,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    is_hidden BOOLEAN NOT NULL DEFAULT FALSE,
     parent_id UUID REFERENCES categories(id) ON DELETE RESTRICT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (id, user_id)
@@ -62,11 +67,13 @@ CREATE TABLE categories (
 
 CREATE UNIQUE INDEX categories_user_name_type_idx
     ON categories (user_id, name, type)
-    WHERE user_id IS NOT NULL;
+    WHERE user_id IS NOT NULL AND family_id IS NULL;
 
 CREATE UNIQUE INDEX categories_default_name_type_idx
     ON categories (name, type)
-    WHERE user_id IS NULL;
+    WHERE user_id IS NULL AND family_id IS NULL;
+CREATE UNIQUE INDEX categories_family_name_type_idx
+    ON categories (family_id, name, type) WHERE family_id IS NOT NULL;
 
 CREATE INDEX categories_parent_id_idx ON categories (parent_id);
 
@@ -95,7 +102,8 @@ BEGIN
         IF parent_category.type <> NEW.type THEN
             RAISE EXCEPTION 'Parent and child categories must have the same type';
         END IF;
-        IF parent_category.user_id IS DISTINCT FROM NEW.user_id THEN
+        IF parent_category.user_id IS DISTINCT FROM NEW.user_id
+            OR parent_category.family_id IS DISTINCT FROM NEW.family_id THEN
             RAISE EXCEPTION 'Parent and child categories must have the same owner';
         END IF;
         IF EXISTS (SELECT 1 FROM categories WHERE parent_id = NEW.id) THEN
@@ -108,7 +116,7 @@ END;
 $$;
 
 CREATE TRIGGER categories_parent_rules_trigger
-    BEFORE INSERT OR UPDATE OF parent_id, type, user_id ON categories
+    BEFORE INSERT OR UPDATE OF parent_id, type, user_id, family_id ON categories
     FOR EACH ROW EXECUTE FUNCTION enforce_category_parent_rules();
 
 CREATE TABLE accounts (
@@ -121,11 +129,27 @@ CREATE TABLE accounts (
         CHECK (opening_balance >= 0),
     currency CHAR(3) NOT NULL DEFAULT 'VND',
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    is_hidden BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX accounts_user_id_idx ON accounts (user_id);
 CREATE INDEX accounts_family_id_idx ON accounts (family_id) WHERE family_id IS NOT NULL;
+
+CREATE TABLE account_adjustments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id UUID NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    amount NUMERIC(14, 2) NOT NULL CHECK (amount <> 0),
+    balance_before NUMERIC(14, 2) NOT NULL,
+    balance_after NUMERIC(14, 2) NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (balance_after = balance_before + amount)
+);
+
+CREATE INDEX account_adjustments_account_created_idx
+    ON account_adjustments (account_id, created_at DESC);
 
 CREATE TABLE transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -226,6 +250,43 @@ CREATE TABLE goal_contributions (
 
 CREATE INDEX goal_contributions_goal_date_idx
     ON goal_contributions (goal_id, contribution_date DESC);
+
+CREATE TABLE goal_withdrawals (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    goal_id UUID NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+    amount NUMERIC(14, 2) NOT NULL CHECK (amount > 0),
+    withdrawal_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX goal_withdrawals_goal_date_idx
+    ON goal_withdrawals (goal_id, withdrawal_date DESC);
+
+CREATE TABLE notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    type VARCHAR(50) NOT NULL,
+    title VARCHAR(200) NOT NULL,
+    message TEXT NOT NULL DEFAULT '',
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    is_read BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX notifications_user_created_idx
+    ON notifications (user_id, created_at DESC);
+CREATE INDEX notifications_user_unread_idx
+    ON notifications (user_id, created_at DESC) WHERE is_read = FALSE;
+
+CREATE TABLE legacy_imports (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    source_key VARCHAR(200) NOT NULL,
+    imported JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (user_id, source_key)
+);
 
 CREATE TABLE recurring_rules (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
